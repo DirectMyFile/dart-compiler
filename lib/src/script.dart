@@ -2,7 +2,9 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of dart2js;
+library dart2js.script;
+
+import 'io/source_file.dart';
 
 class Script {
   final SourceFile file;
@@ -14,7 +16,6 @@ class Script {
    */
   final Uri readableUri;
 
-
   /**
    * The resource URI from which this script was loaded.
    *
@@ -25,9 +26,14 @@ class Script {
   /// This script was synthesized.
   final bool isSynthesized;
 
-  Script(
-      this.readableUri, this.resourceUri, this.file,
-      {this.isSynthesized: false});
+  Script(this.readableUri, this.resourceUri, this.file) : isSynthesized = false;
+
+  Script.synthetic(Uri uri)
+      : readableUri = uri,
+        resourceUri = uri,
+        file = new StringSourceFile.fromUri(
+            uri, "// Synthetic source file generated for '$uri'."),
+        isSynthesized = true;
 
   String get text => (file == null) ? null : file.slowText();
   String get name => (file == null) ? null : file.filename;

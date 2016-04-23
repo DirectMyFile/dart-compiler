@@ -2,7 +2,11 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of tree_ir.optimization;
+library tree_ir.optimization.logical_rewriter;
+
+import '../tree_ir_nodes.dart';
+import 'optimization.dart' show Pass;
+import '../../constants/values.dart' as values;
 
 /// Rewrites logical expressions to be more compact in the Tree IR.
 ///
@@ -43,85 +47,55 @@ part of tree_ir.optimization;
 ///
 ///   x ? true : false  ==>  !!x
 ///
-/// If an operand is known to be a boolean, we can introduce a logical operator:
+/// If the possible falsy values of the condition are known, we can sometimes
+/// introduce a logical operator:
 ///
-///   x ? y : false  ==>  x && y   (if y is known to be a boolean)
+///   !x ? y : false  ==>  !x && y
 ///
-/// The following sequence of rewrites demonstrates the merit of these rules:
-///
-///   x ? (y ? true : false) : false
-///   x ? !!y : false   (double negation introduced by [toBoolean])
-///   x && !!y          (!!y validated by [isBooleanValued])
-///   x && y            (double negation removed by [putInBooleanContext])
-///
-class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
+class LogicalRewriter extends RecursiveTransformer implements Pass {
+  String get passName => 'Logical rewriter';
 
-  /// Statement to be executed next by natural fallthrough. Although fallthrough
-  /// is not introduced in this phase, we need to reason about fallthrough when
-  /// evaluating the benefit of swapping the branches of an [If].
-  Statement fallthrough;
-
-  void rewriteExecutableDefinition(ExecutableDefinition root) {
-    root.body = visitStatement(root.body);
-  }
-
-  void rewriteConstructorDefinition(ConstructorDefinition root) {
-    if (root.isAbstract) return;
-    List<Initializer> initializers = root.initializers;
-    for (int i = 0; i < initializers.length; ++i) {
-      initializers[i] = visitExpression(initializers[i]);
-    }
-    root.body = visitStatement(root.body);
-  }
-
-  Expression visitFieldInitializer(FieldInitializer node) {
+  @override
+  void rewrite(FunctionDefinition node) {
     node.body = visitStatement(node.body);
-    return node;
   }
 
-  visitSuperInitializer(SuperInitializer node) {
-    List<Statement> arguments = node.arguments;
-    for (int i = 0; i < arguments.length; ++i) {
-      arguments[i] = visitStatement(arguments[i]);
-    }
-    return node;
+  final FallthroughStack fallthrough = new FallthroughStack();
+
+  /// True if the given statement is equivalent to its fallthrough semantics.
+  ///
+  /// This means it will ultimately translate to an empty statement.
+  bool isFallthrough(Statement node) {
+    return node is Break && isFallthroughBreak(node) ||
+        node is Continue && isFallthroughContinue(node) ||
+        node is Return && isFallthroughReturn(node);
   }
 
-  Statement visitLabeledStatement(LabeledStatement node) {
-    Statement savedFallthrough = fallthrough;
-    fallthrough = node.next;
-    node.body = visitStatement(node.body);
-    fallthrough = savedFallthrough;
-    node.next = visitStatement(node.next);
-    return node;
+  bool isFallthroughBreak(Break node) {
+    Statement target = fallthrough.target;
+    return node.target.binding.next == target ||
+        target is Break && target.target == node.target;
   }
 
-  Statement visitAssign(Assign node) {
-    node.definition = visitExpression(node.definition);
-    node.next = visitStatement(node.next);
-    return node;
+  bool isFallthroughContinue(Continue node) {
+    Statement target = fallthrough.target;
+    return node.target.binding == target ||
+        target is Continue && target.target == node.target;
   }
 
-  Statement visitReturn(Return node) {
-    node.value = visitExpression(node.value);
-    return node;
+  bool isFallthroughReturn(Return node) {
+    return isNull(node.value) && fallthrough.target == null;
   }
 
-  Statement visitBreak(Break node) {
-    return node;
-  }
-
-  Statement visitContinue(Continue node) {
-    return node;
-  }
-
-  bool isFallthroughBreak(Statement node) {
-    return node is Break && node.target.binding.next == fallthrough;
+  bool isTerminator(Statement node) {
+    return (node is Jump || node is Return) && !isFallthrough(node) ||
+        (node is ExpressionStatement && node.next is Unreachable) ||
+        node is Throw;
   }
 
   Statement visitIf(If node) {
     // If one of the branches is empty (i.e. just a fallthrough), then that
-    // branch should preferrably be the 'else' so we won't have to print it.
+    // branch should preferably be the 'else' so we won't have to print it.
     // In other words, we wish to perform this rewrite:
     //   if (E) {} else {S}
     //     ==>
@@ -129,27 +103,64 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
     // In the tree language, empty statements do not exist yet, so we must check
     // if one branch contains a break that can be eliminated by fallthrough.
 
-    // Swap branches if then is a fallthrough break.
-    if (isFallthroughBreak(node.thenStatement)) {
+    // Rewrite each branch and keep track of which ones might fall through.
+    int usesBefore = fallthrough.useCount;
+    node.thenStatement = visitStatement(node.thenStatement);
+    int usesAfterThen = fallthrough.useCount;
+    node.elseStatement = visitStatement(node.elseStatement);
+    bool thenHasFallthrough = (fallthrough.useCount > usesBefore);
+    bool elseHasFallthrough = (fallthrough.useCount > usesAfterThen);
+
+    // Determine which branch is most beneficial as 'then' branch.
+    const int THEN = 1;
+    const int NEITHER = 0;
+    const int ELSE = -1;
+    int bestThenBranch = NEITHER;
+    if (isFallthrough(node.thenStatement) &&
+        !isFallthrough(node.elseStatement)) {
+      // Put the empty statement in the 'else' branch.
+      // if (E) {} else {S} ==> if (!E) {S}
+      bestThenBranch = ELSE;
+    } else if (isFallthrough(node.elseStatement) &&
+        !isFallthrough(node.thenStatement)) {
+      // Keep the empty statement in the 'else' branch.
+      // if (E) {S} else {}
+      bestThenBranch = THEN;
+    } else if (thenHasFallthrough && !elseHasFallthrough) {
+      // Put abrupt termination in the 'then' branch to omit 'else'.
+      // if (E) {S1} else {S2; return v} ==> if (!E) {S2; return v}; S1
+      bestThenBranch = ELSE;
+    } else if (!thenHasFallthrough && elseHasFallthrough) {
+      // Keep abrupt termination in the 'then' branch to omit 'else'.
+      // if (E) {S1; return v}; S2
+      bestThenBranch = THEN;
+    } else if (isTerminator(node.elseStatement) &&
+        !isTerminator(node.thenStatement)) {
+      // Put early termination in the 'then' branch to reduce nesting depth.
+      // if (E) {S}; return v ==> if (!E) return v; S
+      bestThenBranch = ELSE;
+    } else if (isTerminator(node.thenStatement) &&
+        !isTerminator(node.elseStatement)) {
+      // Keep early termination in the 'then' branch to reduce nesting depth.
+      // if (E) {return v;} S
+      bestThenBranch = THEN;
+    }
+
+    // Swap branches if 'else' is better as 'then'
+    if (bestThenBranch == ELSE) {
       node.condition = new Not(node.condition);
       Statement tmp = node.thenStatement;
       node.thenStatement = node.elseStatement;
       node.elseStatement = tmp;
     }
 
-    // Can the else part be eliminated?
-    // (Either due to the above swap or if the break was already there).
-    bool emptyElse = isFallthroughBreak(node.elseStatement);
-
-    node.condition = makeCondition(node.condition, true, liftNots: !emptyElse);
-    node.thenStatement = visitStatement(node.thenStatement);
-    node.elseStatement = visitStatement(node.elseStatement);
-
-    // If neither branch is empty, eliminate a negation in the condition
+    // If neither branch is better, eliminate a negation in the condition
     // if (!E) S1 else S2
     //   ==>
     // if (E) S2 else S1
-    if (!emptyElse && node.condition is Not) {
+    node.condition = makeCondition(node.condition, true,
+        liftNots: bestThenBranch == NEITHER);
+    if (bestThenBranch == NEITHER && node.condition is Not) {
       node.condition = (node.condition as Not).operand;
       Statement tmp = node.thenStatement;
       node.thenStatement = node.elseStatement;
@@ -159,98 +170,79 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
     return node;
   }
 
-  Statement visitWhileTrue(WhileTrue node) {
+  Statement visitLabeledStatement(LabeledStatement node) {
+    fallthrough.push(node.next);
     node.body = visitStatement(node.body);
+    fallthrough.pop();
+    node.next = visitStatement(node.next);
     return node;
   }
 
-  Statement visitWhileCondition(WhileCondition node) {
+  Statement visitWhileTrue(WhileTrue node) {
+    fallthrough.push(node);
+    node.body = visitStatement(node.body);
+    fallthrough.pop();
+    return node;
+  }
+
+  Statement visitFor(For node) {
+    fallthrough.push(node);
     node.condition = makeCondition(node.condition, true, liftNots: false);
     node.body = visitStatement(node.body);
+    fallthrough.pop();
     node.next = visitStatement(node.next);
     return node;
   }
 
-  Statement visitExpressionStatement(ExpressionStatement node) {
-    node.expression = visitExpression(node.expression);
-    node.next = visitStatement(node.next);
+  Statement visitBreak(Break node) {
+    if (isFallthroughBreak(node)) {
+      fallthrough.use();
+    }
     return node;
   }
 
-
-  Expression visitVariable(Variable node) {
+  Statement visitContinue(Continue node) {
+    if (isFallthroughContinue(node)) {
+      fallthrough.use();
+    }
     return node;
   }
 
-  Expression visitInvokeStatic(InvokeStatic node) {
-    _rewriteList(node.arguments);
-    return node;
-  }
-
-  Expression visitInvokeMethod(InvokeMethod node) {
-    node.receiver = visitExpression(node.receiver);
-    _rewriteList(node.arguments);
-    return node;
-  }
-
-  Expression visitInvokeSuperMethod(InvokeSuperMethod node) {
-    _rewriteList(node.arguments);
-    return node;
-  }
-
-  Expression visitInvokeConstructor(InvokeConstructor node) {
-    _rewriteList(node.arguments);
-    return node;
-  }
-
-  Expression visitConcatenateStrings(ConcatenateStrings node) {
-    _rewriteList(node.arguments);
-    return node;
-  }
-
-  Expression visitLiteralList(LiteralList node) {
-    _rewriteList(node.values);
-    return node;
-  }
-
-  Expression visitLiteralMap(LiteralMap node) {
-    node.entries.forEach((LiteralMapEntry entry) {
-      entry.key = visitExpression(entry.key);
-      entry.value = visitExpression(entry.value);
-    });
-    return node;
-  }
-
-  Expression visitTypeOperator(TypeOperator node) {
-    node.receiver = visitExpression(node.receiver);
-    return node;
-  }
-
-  Expression visitConstant(Constant node) {
-    return node;
-  }
-
-  Expression visitThis(This node) {
-    return node;
-  }
-
-  Expression visitReifyTypeVar(ReifyTypeVar node) {
-    return node;
-  }
-
-  Expression visitFunctionExpression(FunctionExpression node) {
-    new LogicalRewriter().rewrite(node.definition);
-    return node;
-  }
-
-  Statement visitFunctionDeclaration(FunctionDeclaration node) {
-    new LogicalRewriter().rewrite(node.definition);
-    node.next = visitStatement(node.next);
+  Statement visitReturn(Return node) {
+    node.value = visitExpression(node.value);
+    if (isFallthroughReturn(node)) {
+      fallthrough.use();
+    }
     return node;
   }
 
   Expression visitNot(Not node) {
     return toBoolean(makeCondition(node.operand, false, liftNots: false));
+  }
+
+  /// True if the only possible falsy return value of [condition] is [value].
+  ///
+  /// If [value] is `null` or a truthy value, false is returned. This is to make
+  /// pattern matching more convenient.
+  bool matchesFalsyValue(Expression condition, values.ConstantValue value) {
+    if (value == null) return false;
+    // TODO(asgerf): Here we could really use some more type information,
+    //               this is just the best we can do at the moment.
+    return isBooleanValued(condition) && value.isFalse;
+  }
+
+  /// True if the only possible truthy return value of [condition] is [value].
+  ///
+  /// If [value] is `null` or a falsy value, false is returned. This is to make
+  /// pattern matching more convenient.
+  bool matchesTruthyValue(Expression condition, values.ConstantValue value) {
+    if (value == null) return false;
+    // TODO(asgerf): Again, more type information could really beef this up.
+    return isBooleanValued(condition) && value.isTrue;
+  }
+
+  values.ConstantValue getConstant(Expression exp) {
+    return exp is Constant ? exp.value : null;
   }
 
   Expression visitConditional(Conditional node) {
@@ -271,29 +263,30 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
       return toBoolean(makeCondition(node.condition, false, liftNots: false));
     }
 
-    // x ? y : false ==> x && y  (if y is known to be a boolean)
-    if (isBooleanValued(node.thenExpression) && isFalse(node.elseExpression)) {
+    // x ? y : false ==> x && y  (if x is truthy or false)
+    // x ? y : null  ==> x && y  (if x is truthy or null)
+    // x ? y : 0     ==> x && y  (if x is truthy or zero) (and so on...)
+    if (matchesFalsyValue(node.condition, getConstant(node.elseExpression))) {
       return new LogicalOperator.and(
-          makeCondition(node.condition, true, liftNots:false),
-          putInBooleanContext(node.thenExpression));
+          visitExpression(node.condition), node.thenExpression);
     }
-    // x ? y : true ==> !x || y  (if y is known to be a boolean)
-    if (isBooleanValued(node.thenExpression) && isTrue(node.elseExpression)) {
+    // x ? true : y ==> x || y  (if x is falsy or true)
+    // x ? 1    : y ==> x || y  (if x is falsy or one) (and so on...)
+    if (matchesTruthyValue(node.condition, getConstant(node.thenExpression))) {
       return new LogicalOperator.or(
-          makeCondition(node.condition, false, liftNots: false),
-          putInBooleanContext(node.thenExpression));
+          visitExpression(node.condition), node.elseExpression);
     }
-    // x ? true : y ==> x || y  (if y if known to be boolean)
-    if (isBooleanValued(node.elseExpression) && isTrue(node.thenExpression)) {
+    // x ? y : true ==> !x || y
+    if (isTrue(node.elseExpression)) {
       return new LogicalOperator.or(
-          makeCondition(node.condition, true, liftNots: false),
-          putInBooleanContext(node.elseExpression));
+          toBoolean(makeCondition(node.condition, false, liftNots: false)),
+          node.thenExpression);
     }
-    // x ? false : y ==> !x && y  (if y is known to be a boolean)
-    if (isBooleanValued(node.elseExpression) && isFalse(node.thenExpression)) {
+    // x ? false : y ==> !x && y
+    if (isFalse(node.thenExpression)) {
       return new LogicalOperator.and(
-          makeCondition(node.condition, false, liftNots: false),
-          putInBooleanContext(node.elseExpression));
+          toBoolean(makeCondition(node.condition, false, liftNots: false)),
+          node.elseExpression);
     }
 
     node.condition = makeCondition(node.condition, true);
@@ -306,33 +299,23 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
       node.elseExpression = tmp;
     }
 
+    // x ? y : x ==> x && y
+    if (isSameVariable(node.condition, node.elseExpression)) {
+      destroyVariableUse(node.elseExpression);
+      return new LogicalOperator.and(node.condition, node.thenExpression);
+    }
+    // x ? x : y ==> x || y
+    if (isSameVariable(node.condition, node.thenExpression)) {
+      destroyVariableUse(node.thenExpression);
+      return new LogicalOperator.or(node.condition, node.elseExpression);
+    }
+
     return node;
   }
 
   Expression visitLogicalOperator(LogicalOperator node) {
-    node.left = makeCondition(node.left, true);
-    node.right = makeCondition(node.right, true);
-    return node;
-  }
-
-  Statement visitSetField(SetField node) {
-    node.object = visitExpression(node.object);
-    node.value = visitExpression(node.value);
-    node.next = visitStatement(node.next);
-    return node;
-  }
-
-  Expression visitGetField(GetField node) {
-    node.object = visitExpression(node.object);
-    return node;
-  }
-
-  Expression visitCreateBox(CreateBox node) {
-    return node;
-  }
-
-  Expression visitCreateClosureClass(CreateClosureClass node) {
-    _rewriteList(node.arguments);
+    node.left = visitExpression(node.left);
+    node.right = visitExpression(node.right);
     return node;
   }
 
@@ -341,16 +324,77 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
   /// applied to the result of [visitExpression] conditionals will have been
   /// rewritten anyway.
   bool isBooleanValued(Expression e) {
-    return isTrue(e) || isFalse(e) || e is Not || e is LogicalOperator;
+    return isTrue(e) ||
+        isFalse(e) ||
+        e is Not ||
+        e is LogicalOperator && isBooleanValuedLogicalOperator(e) ||
+        e is ApplyBuiltinOperator && operatorReturnsBool(e.operator) ||
+        e is TypeOperator && isBooleanValuedTypeOperator(e);
   }
 
-  /// Rewrite an expression that was originally processed in a non-boolean
-  /// context.
-  Expression putInBooleanContext(Expression e) {
-    if (e is Not && e.operand is Not) {
-      return (e.operand as Not).operand;
-    } else {
-      return e;
+  bool isBooleanValuedLogicalOperator(LogicalOperator e) {
+    return isBooleanValued(e.left) && isBooleanValued(e.right);
+  }
+
+  /// True if the given operator always returns `true` or `false`.
+  bool operatorReturnsBool(BuiltinOperator operator) {
+    switch (operator) {
+      case BuiltinOperator.StrictEq:
+      case BuiltinOperator.StrictNeq:
+      case BuiltinOperator.LooseEq:
+      case BuiltinOperator.LooseNeq:
+      case BuiltinOperator.NumLt:
+      case BuiltinOperator.NumLe:
+      case BuiltinOperator.NumGt:
+      case BuiltinOperator.NumGe:
+      case BuiltinOperator.IsNumber:
+      case BuiltinOperator.IsNotNumber:
+      case BuiltinOperator.IsFloor:
+      case BuiltinOperator.IsInteger:
+      case BuiltinOperator.IsNotInteger:
+      case BuiltinOperator.Identical:
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  bool isBooleanValuedTypeOperator(TypeOperator e) {
+    return e.isTypeTest;
+  }
+
+  BuiltinOperator negateBuiltin(BuiltinOperator operator) {
+    switch (operator) {
+      case BuiltinOperator.StrictEq:
+        return BuiltinOperator.StrictNeq;
+      case BuiltinOperator.StrictNeq:
+        return BuiltinOperator.StrictEq;
+      case BuiltinOperator.LooseEq:
+        return BuiltinOperator.LooseNeq;
+      case BuiltinOperator.LooseNeq:
+        return BuiltinOperator.LooseEq;
+      case BuiltinOperator.IsNumber:
+        return BuiltinOperator.IsNotNumber;
+      case BuiltinOperator.IsNotNumber:
+        return BuiltinOperator.IsNumber;
+      case BuiltinOperator.IsInteger:
+        return BuiltinOperator.IsNotInteger;
+      case BuiltinOperator.IsNotInteger:
+        return BuiltinOperator.IsInteger;
+      case BuiltinOperator.IsUnsigned32BitInteger:
+        return BuiltinOperator.IsNotUnsigned32BitInteger;
+      case BuiltinOperator.IsNotUnsigned32BitInteger:
+        return BuiltinOperator.IsUnsigned32BitInteger;
+
+      // Because of NaN, these do not have a negated form.
+      case BuiltinOperator.NumLt:
+      case BuiltinOperator.NumLe:
+      case BuiltinOperator.NumGt:
+      case BuiltinOperator.NumGe:
+        return null;
+
+      default:
+        return null;
     }
   }
 
@@ -366,8 +410,8 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
   /// context where its result is immediately subject to boolean conversion.
   /// If [polarity] if false, the negated condition will be created instead.
   /// If [liftNots] is true (default) then Not expressions will be lifted toward
-  /// the root the condition so they can be eliminated by the caller.
-  Expression makeCondition(Expression e, bool polarity, {bool liftNots:true}) {
+  /// the root of the condition so they can be eliminated by the caller.
+  Expression makeCondition(Expression e, bool polarity, {bool liftNots: true}) {
     if (e is Not) {
       // !!E ==> E
       return makeCondition(e.operand, !polarity, liftNots: liftNots);
@@ -388,6 +432,15 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
       }
       return e;
     }
+    if (e is ApplyBuiltinOperator && polarity == false) {
+      BuiltinOperator negated = negateBuiltin(e.operator);
+      if (negated != null) {
+        e.operator = negated;
+        return visitExpression(e);
+      } else {
+        return new Not(visitExpression(e));
+      }
+    }
     if (e is Conditional) {
       // Handle polarity by: !(x ? y : z) ==> x ? !y : !z
       // Rewrite individual branches now. The condition will be rewritten
@@ -405,27 +458,23 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
       }
       // x ? true : y  ==> x || y
       if (isTrue(e.thenExpression)) {
-        return makeOr(makeCondition(e.condition, true),
-                      e.elseExpression,
-                      liftNots: liftNots);
+        return makeOr(makeCondition(e.condition, true), e.elseExpression,
+            liftNots: liftNots);
       }
       // x ? false : y  ==> !x && y
       if (isFalse(e.thenExpression)) {
-        return makeAnd(makeCondition(e.condition, false),
-                       e.elseExpression,
-                       liftNots: liftNots);
+        return makeAnd(makeCondition(e.condition, false), e.elseExpression,
+            liftNots: liftNots);
       }
       // x ? y : true  ==> !x || y
       if (isTrue(e.elseExpression)) {
-        return makeOr(makeCondition(e.condition, false),
-                      e.thenExpression,
-                      liftNots: liftNots);
+        return makeOr(makeCondition(e.condition, false), e.thenExpression,
+            liftNots: liftNots);
       }
       // x ? y : false  ==> x && y
       if (isFalse(e.elseExpression)) {
-        return makeAnd(makeCondition(e.condition, true),
-                       e.thenExpression,
-                       liftNots: liftNots);
+        return makeAnd(makeCondition(e.condition, true), e.thenExpression,
+            liftNots: liftNots);
       }
 
       e.condition = makeCondition(e.condition, true);
@@ -443,18 +492,34 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
         e.elseExpression = (e.elseExpression as Not).operand;
         return new Not(e);
       }
+
+      // x ? y : x ==> x && y
+      if (isSameVariable(e.condition, e.elseExpression)) {
+        destroyVariableUse(e.elseExpression);
+        return new LogicalOperator.and(e.condition, e.thenExpression);
+      }
+      // x ? x : y ==> x || y
+      if (isSameVariable(e.condition, e.thenExpression)) {
+        destroyVariableUse(e.thenExpression);
+        return new LogicalOperator.or(e.condition, e.elseExpression);
+      }
+
       return e;
     }
     if (e is Constant && e.value.isBool) {
       // !true ==> false
       if (!polarity) {
         values.BoolConstantValue value = e.value;
-        return new Constant.primitive(value.negate());
+        return new Constant.bool(value.negate());
       }
       return e;
     }
     e = visitExpression(e);
     return polarity ? e : new Not(e);
+  }
+
+  bool isNull(Expression e) {
+    return e is Constant && e.value.isNull;
   }
 
   bool isTrue(Expression e) {
@@ -481,11 +546,21 @@ class LogicalRewriter extends Visitor<Statement, Expression> with PassMixin {
     }
   }
 
-  /// Destructively updates each entry of [l] with the result of visiting it.
-  void _rewriteList(List<Expression> l) {
-    for (int i = 0; i < l.length; i++) {
-      l[i] = visitExpression(l[i]);
+  /// True if [e2] is known to return the same value as [e1]
+  /// (with no additional side effects) if evaluated immediately after [e1].
+  ///
+  /// Concretely, this is true if [e1] and [e2] are uses of the same variable,
+  /// or if [e2] is a use of a variable assigned by [e1].
+  bool isSameVariable(Expression e1, Expression e2) {
+    if (e1 is VariableUse) {
+      return e2 is VariableUse && e1.variable == e2.variable;
+    } else if (e1 is Assign) {
+      return e2 is VariableUse && e1.variable == e2.variable;
     }
+    return false;
+  }
+
+  void destroyVariableUse(VariableUse node) {
+    --node.variable.readCount;
   }
 }
-

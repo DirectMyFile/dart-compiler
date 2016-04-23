@@ -11,75 +11,120 @@ library dart2js.use_unused_api;
 import '../compiler.dart' as api;
 
 import 'colors.dart' as colors;
+import 'compiler.dart' as compiler;
+import 'constants/constant_system.dart' as constants;
+import 'constants/constructors.dart' as constants;
+import 'constants/evaluation.dart' as constants;
+import 'constants/expressions.dart' as constants;
 import 'constants/values.dart' as constants;
 import 'cps_ir/cps_ir_builder.dart' as ir_builder;
-import 'cps_ir/cps_ir_nodes_sexpr.dart' as cps_ir_nodes_sexpr;
+import 'cps_ir/cps_ir_builder_task.dart' as ir_builder;
+import 'tree_ir/tree_ir_nodes.dart' as tree_ir;
 import 'dart_types.dart' as dart_types;
 import 'dart2js.dart' as dart2js;
-import 'dart2jslib.dart' as dart2jslib;
+import 'deferred_load.dart' as deferred;
+import 'diagnostics/source_span.dart' as diagnostics;
 import 'elements/elements.dart' as elements;
 import 'elements/modelx.dart' as modelx;
 import 'elements/visitor.dart' as elements_visitor;
 import 'filenames.dart' as filenames;
-import 'inferrer/concrete_types_inferrer.dart' as concrete_types_inferrer;
 import 'inferrer/type_graph_inferrer.dart' as type_graph_inferrer;
-import 'io/code_output.dart' as io;
+import 'io/line_column_provider.dart' as io;
+import 'io/source_map_builder.dart' as io;
 import 'js/js.dart' as js;
+import 'js_backend/js_backend.dart' as js_backend;
 import 'js_emitter/js_emitter.dart' as js_emitter;
+import 'js_emitter/full_emitter/emitter.dart' as full;
+import 'js_emitter/program_builder/program_builder.dart' as program_builder;
+import 'resolution/semantic_visitor.dart' as semantic_visitor;
+import 'resolution/operators.dart' as operators;
+import 'script.dart';
 import 'source_file_provider.dart' as source_file_provider;
-import 'ssa/ssa.dart' as ssa;
+import 'ssa/nodes.dart' as ssa;
 import 'tree/tree.dart' as tree;
-import 'universe/universe.dart' as universe;
 import 'util/util.dart' as util;
+import 'world.dart';
 
-import 'scanner/scannerlib.dart' show
-    PartialClassElement,
-    PartialFunctionElement;
+import 'parser/partial_elements.dart'
+    show PartialClassElement, PartialFunctionElement;
 
-class ElementVisitor extends elements_visitor.ElementVisitor {
-  visitElement(e) {}
+class ElementVisitor extends elements_visitor.BaseElementVisitor {
+  visitElement(e, a) {}
 }
 
 void main(List<String> arguments) {
-  useApi();
+  useApi(null);
   dart2js.main(arguments);
-  useConstant(null, null);
+  elements.Name.isPublicName(null);
+  useConstant();
   useNode(null);
   useUtil(null);
   useSetlet(null);
   useImmutableEmptySet(null);
   useElementVisitor(new ElementVisitor());
-  useJs(new js.Program(null));
-  useJs(new js.Blob(null));
-  useJs(new js.NamedFunction(null, null));
-  useJs(new js.ArrayHole());
-  useConcreteTypesInferrer(null);
+  useJsNode(new js.Program(null));
+  useJsNode(new js.NamedFunction(null, null));
+  useJsNode(new js.ArrayHole());
+  useJsOther(new js.SimpleJavaScriptPrintingContext());
+  useJsBackend(null);
   useColor();
   useFilenames();
   useSsa(null);
-  useCodeBuffer(null);
+  useIo();
   usedByTests();
-  useElements(null, null, null, null, null);
-  useIr(null, null, null);
+  useElements();
+  useIr(null);
   useCompiler(null);
   useTypes();
   useCodeEmitterTask(null);
   useScript(null);
+  useProgramBuilder(null);
+  useSemanticVisitor();
+  useTreeVisitors();
+  useDeferred();
 }
 
-useApi() {
-  api.ReadStringFromUri uri;
+useApi([api.ReadStringFromUri uri, compiler.Compiler compiler]) {
+  compiler.analyzeUri(null);
+  new diagnostics.SourceSpan.fromNode(null, null);
 }
 
-void useConstant(constants.ConstantValue constant,
-                 dart2jslib.ConstantSystem cs) {
+class NullConstantConstructorVisitor
+    extends constants.ConstantConstructorVisitor {
+  @override
+  visitGenerative(constants.GenerativeConstantConstructor constructor, arg) {}
+
+  @override
+  visitRedirectingFactory(
+      constants.RedirectingFactoryConstantConstructor constructor, arg) {}
+
+  @override
+  visitRedirectingGenerative(
+      constants.RedirectingGenerativeConstantConstructor constructor, arg) {}
+}
+
+void useConstant(
+    [constants.ConstantValue constant,
+    constants.ConstantExpression expression,
+    constants.ConstructedConstantExpression constructedConstant,
+    constants.ConstantSystem cs,
+    constants.Environment env]) {
   constant.isObject;
   cs.isBool(constant);
+  constructedConstant.computeInstanceType();
+  constructedConstant.computeInstanceFields();
+  expression.evaluate(null, null);
+  new NullConstantConstructorVisitor()
+    ..visit(null, null)
+    ..visitGenerative(null, null)
+    ..visitRedirectingFactory(null, null)
+    ..visitRedirectingGenerative(null, null);
 }
 
 void useNode(tree.Node node) {
   node
     ..asAsyncModifier()
+    ..asAsyncForIn()
     ..asAwait()
     ..asBreakStatement()
     ..asCascade()
@@ -94,6 +139,7 @@ void useNode(tree.Node node) {
     ..asFor()
     ..asFunctionDeclaration()
     ..asIf()
+    ..asImport()
     ..asLabeledStatement()
     ..asLibraryDependency()
     ..asLibraryName()
@@ -116,6 +162,7 @@ void useNode(tree.Node node) {
     ..asStringNode()
     ..asSwitchCase()
     ..asSwitchStatement()
+    ..asSyncForIn()
     ..asTryStatement()
     ..asTypeAnnotation()
     ..asTypeVariable()
@@ -142,36 +189,40 @@ void useImmutableEmptySet(util.ImmutableEmptySet set) {
 
 void useElementVisitor(ElementVisitor visitor) {
   visitor
-    ..visit(null)
-    ..visitAbstractFieldElement(null)
-    ..visitAmbiguousElement(null)
-    ..visitBoxFieldElement(null)
-    ..visitClassElement(null)
-    ..visitClosureClassElement(null)
-    ..visitClosureFieldElement(null)
-    ..visitCompilationUnitElement(null)
-    ..visitConstructorBodyElement(null)
-    ..visitElement(null)
-    ..visitErroneousElement(null)
-    ..visitFieldParameterElement(null)
-    ..visitFunctionElement(null)
-    ..visitLibraryElement(null)
-    ..visitMixinApplicationElement(null)
-    ..visitPrefixElement(null)
-    ..visitScopeContainerElement(null)
-    ..visitTypeDeclarationElement(null)
-    ..visitTypeVariableElement(null)
-    ..visitTypedefElement(null)
-    ..visitVariableElement(null)
-    ..visitWarnOnUseElement(null);
+    ..visit(null, null)
+    ..visitAbstractFieldElement(null, null)
+    ..visitAmbiguousElement(null, null)
+    ..visitBoxFieldElement(null, null)
+    ..visitClassElement(null, null)
+    ..visitClosureClassElement(null, null)
+    ..visitClosureFieldElement(null, null)
+    ..visitCompilationUnitElement(null, null)
+    ..visitConstructorBodyElement(null, null)
+    ..visitElement(null, null)
+    ..visitErroneousElement(null, null)
+    ..visitFieldParameterElement(null, null)
+    ..visitFunctionElement(null, null)
+    ..visitLibraryElement(null, null)
+    ..visitMixinApplicationElement(null, null)
+    ..visitPrefixElement(null, null)
+    ..visitScopeContainerElement(null, null)
+    ..visitTypeDeclarationElement(null, null)
+    ..visitTypeVariableElement(null, null)
+    ..visitTypedefElement(null, null)
+    ..visitVariableElement(null, null)
+    ..visitWarnOnUseElement(null, null);
 }
 
-useJs(js.Node node) {
+useJsNode(js.Node node) {
   node.asVariableUse();
 }
 
-useConcreteTypesInferrer(concrete_types_inferrer.ConcreteTypesInferrer c) {
-  c.debug();
+useJsOther(js.SimpleJavaScriptPrintingContext context) {
+  context.getText();
+}
+
+useJsBackend(js_backend.JavaScriptBackend backend) {
+  backend.getGeneratedCode(null);
 }
 
 useColor() {
@@ -191,87 +242,98 @@ useSsa(ssa.HInstruction instruction) {
   new ssa.HStatementSequenceInformation(null);
 }
 
-useCodeBuffer(io.CodeBuffer buffer) {
+useIo([io.LineColumnMap map, io.LineColumnProvider provider]) {
+  map
+    ..addFirst(null, null, null)
+    ..forEachLine(null)
+    ..getFirstElementsInLine(null)
+    ..forEachColumn(null, null);
+  provider.getOffset(null, null);
 }
 
 usedByTests() {
   // TODO(ahe): We should try to avoid including API used only for tests. In
   // most cases, such API can be moved to a test library.
-  dart2jslib.World world = null;
-  dart2jslib.Compiler compiler = null;
-  compiler.currentlyInUserCode();
+  World world = null;
   type_graph_inferrer.TypeGraphInferrer typeGraphInferrer = null;
   source_file_provider.SourceFileProvider sourceFileProvider = null;
-  world.hasAnyUserDefinedGetter(null);
+  sourceFileProvider.getSourceFile(null);
+  world.hasAnyUserDefinedGetter(null, null);
+  world.subclassesOf(null);
+  world.getClassHierarchyNode(null);
+  world.getClassSet(null);
+  world.haveAnyCommonSubtypes(null, null);
   typeGraphInferrer.getCallersOf(null);
   dart_types.Types.sorted(null);
-  new dart_types.Types(compiler).copy(compiler);
-  new universe.TypedSelector.subclass(null, null, compiler.world);
-  new universe.TypedSelector.subtype(null, null, compiler.world);
-  new universe.TypedSelector.exact(null, null, compiler.world);
+  new dart_types.Types(null).copy(null);
   sourceFileProvider.readStringFromUri(null);
 }
 
 useElements(
-    elements.ClassElement e,
+    [elements.ClassElement e,
     elements.Name n,
     modelx.FieldElementX f,
     PartialClassElement pce,
-    PartialFunctionElement pfe) {
+    PartialFunctionElement pfe,
+    elements.LibraryElement l]) {
   e.lookupClassMember(null);
   e.lookupInterfaceMember(null);
   n.isAccessibleFrom(null);
   f.reuseElement();
   pce.copyWithEnclosing(null);
   pfe.copyWithEnclosing(null);
+  l.forEachImport(null);
 }
 
-useIr(cps_ir_nodes_sexpr.SExpressionStringifier stringifier,
-      ir_builder.IrBuilderTask task,
-      ir_builder.IrBuilder builder) {
-  new cps_ir_nodes_sexpr.SExpressionStringifier();
-  stringifier
-    ..newContinuationName(null)
-    ..newValueName(null)
-    ..visitConstant(null)
-    ..visitContinuation(null)
-    ..visitDefinition(null)
-    ..visitExpression(null)
-    ..visitFunctionDefinition(null)
-    ..visitFieldDefinition(null)
-    ..visitInvokeStatic(null)
-    ..visitLetCont(null)
-    ..visitNode(null)
-    ..visitParameter(null);
-  task
-    ..hasIr(null)
-    ..getIr(null);
-  builder
-    ..buildIntegerLiteral(null)
-    ..buildDoubleLiteral(null)
-    ..buildBooleanLiteral(null)
-    ..buildNullLiteral()
-    ..buildStringLiteral(null)
-    ..buildDynamicGet(null, null)
-    ..buildSuperGet(null);
+useIr(ir_builder.IrBuilder builder) {
+  builder..buildStringConstant(null);
 }
 
-useCompiler(dart2jslib.Compiler compiler) {
-  compiler.libraryLoader
-      ..reset()
-      ..resetAsync(null)
-      ..lookupLibrary(null);
-  compiler.forgetElement(null);
+useCompiler(compiler.Compiler c) {
+  c.libraryLoader
+    ..reset()
+    ..resetAsync(null)
+    ..lookupLibrary(null);
+  c.forgetElement(null);
+  c.backend.constantCompilerTask.copyConstantValues(null);
+  c.currentlyInUserCode();
 }
 
-useTypes() {
-  new dart_types.ResolvedTypedefType(null, null, null).unalias(null);
-}
+useTypes() {}
 
 useCodeEmitterTask(js_emitter.CodeEmitterTask codeEmitterTask) {
-  codeEmitterTask.oldEmitter.clearCspPrecompiledNodes();
+  full.Emitter fullEmitter = codeEmitterTask.emitter;
+  fullEmitter.clearCspPrecompiledNodes();
+  fullEmitter.buildLazilyInitializedStaticField(null, isolateProperties: null);
 }
 
-useScript(dart2jslib.Script script) {
+useScript(Script script) {
   script.copyWithFile(null);
+}
+
+useProgramBuilder(program_builder.ProgramBuilder builder) {
+  builder.buildMethodHackForIncrementalCompilation(null);
+  builder.buildFieldsHackForIncrementalCompilation(null);
+}
+
+useSemanticVisitor() {
+  operators.UnaryOperator.fromKind(null);
+  operators.BinaryOperator.fromKind(null);
+  new semantic_visitor.BulkSendVisitor()..apply(null, null);
+  new semantic_visitor.TraversalVisitor(null).apply(null, null);
+  new semantic_visitor.BulkDeclarationVisitor().apply(null, null);
+}
+
+class TreeVisitor1 extends tree_ir.ExpressionVisitor1
+    with tree_ir.StatementVisitor1 {
+  noSuchMethod(inv) {}
+}
+
+useTreeVisitors() {
+  new TreeVisitor1().visitExpression(null, null);
+  new TreeVisitor1().visitStatement(null, null);
+}
+
+useDeferred([deferred.DeferredLoadTask task]) {
+  task.dump();
 }

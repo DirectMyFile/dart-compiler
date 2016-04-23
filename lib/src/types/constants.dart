@@ -4,8 +4,10 @@
 
 library types.constants;
 
+import '../common.dart';
+import '../compiler.dart' show Compiler;
 import '../constants/values.dart';
-import '../dart2jslib.dart';
+import '../js_backend/js_backend.dart' show SyntheticConstantKind;
 import 'types.dart';
 
 /// Computes the [TypeMask] for the constant [value].
@@ -17,8 +19,8 @@ class ConstantValueTypeMasks extends ConstantValueVisitor<TypeMask, Compiler> {
   const ConstantValueTypeMasks();
 
   @override
-  TypeMask visitConstructed(ConstructedConstantValue constant,
-                            Compiler compiler) {
+  TypeMask visitConstructed(
+      ConstructedConstantValue constant, Compiler compiler) {
     if (compiler.backend.isInterceptorClass(constant.type.element)) {
       return compiler.typesTask.nonNullType;
     }
@@ -32,21 +34,35 @@ class ConstantValueTypeMasks extends ConstantValueVisitor<TypeMask, Compiler> {
 
   @override
   TypeMask visitDouble(DoubleConstantValue constant, Compiler compiler) {
-    // We have to distinguish -0.0 from 0, but for all practical purposes
-    // -0.0 is an integer.
-    // TODO(17235): this kind of special casing should only happen in the
-    // backend.
-    if (constant.isMinusZero &&
-        compiler.backend.constantSystem.isInt(constant)) {
-      return compiler.typesTask.uint31Type;
+    // We have to recognize double constants that are 'is int'.
+    if (compiler.backend.constantSystem.isInt(constant)) {
+      if (constant.isMinusZero) {
+        return compiler.typesTask.uint31Type;
+      } else {
+        assert(constant.isPositiveInfinity || constant.isNegativeInfinity);
+        return compiler.typesTask.intType;
+      }
     }
-    assert(!compiler.backend.constantSystem.isInt(constant));
     return compiler.typesTask.doubleType;
   }
 
   @override
-  TypeMask visitDummy(DummyConstantValue constant, Compiler compiler) {
-    return constant.typeMask;
+  TypeMask visitSynthetic(SyntheticConstantValue constant, Compiler compiler) {
+    switch (constant.kind) {
+      case SyntheticConstantKind.DUMMY_INTERCEPTOR:
+        return constant.payload;
+      case SyntheticConstantKind.EMPTY_VALUE:
+        return constant.payload;
+      case SyntheticConstantKind.TYPEVARIABLE_REFERENCE:
+        return compiler.typesTask.intType;
+      case SyntheticConstantKind.NAME:
+        return compiler.typesTask.stringType;
+      default:
+        DiagnosticReporter reporter = compiler.reporter;
+        reporter.internalError(
+            CURRENT_ELEMENT_SPANNABLE, "Unexpected DummyConstantKind.");
+        return null;
+    }
   }
 
   @override
@@ -68,8 +84,8 @@ class ConstantValueTypeMasks extends ConstantValueVisitor<TypeMask, Compiler> {
   }
 
   @override
-  TypeMask visitInterceptor(InterceptorConstantValue constant,
-                            Compiler compiler) {
+  TypeMask visitInterceptor(
+      InterceptorConstantValue constant, Compiler compiler) {
     return compiler.typesTask.nonNullType;
   }
 

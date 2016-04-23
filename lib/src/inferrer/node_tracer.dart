@@ -2,70 +2,77 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of type_graph_inferrer;
+library compiler.src.inferrer.node_tracer;
+
+import '../common/names.dart' show Identifiers;
+import '../compiler.dart' show Compiler;
+import '../elements/elements.dart';
+import '../types/types.dart' show ContainerTypeMask, MapTypeMask;
+import '../util/util.dart' show Setlet;
+
+import 'type_graph_inferrer.dart' show TypeGraphInferrerEngine;
+import 'type_graph_nodes.dart';
+import 'debug.dart' as debug;
 
 // A set of selectors we know do not escape the elements inside the
 // list.
-Set<String> doesNotEscapeListSet = new Set<String>.from(
-  const <String>[
-    // From Object.
-    '==',
-    'hashCode',
-    'toString',
-    'noSuchMethod',
-    'runtimeType',
+Set<String> doesNotEscapeListSet = new Set<String>.from(const <String>[
+  // From Object.
+  '==',
+  'hashCode',
+  'toString',
+  'noSuchMethod',
+  'runtimeType',
 
-    // From Iterable.
-    'isEmpty',
-    'isNotEmpty',
-    'length',
-    'any',
-    'contains',
-    'every',
-    'join',
+  // From Iterable.
+  'isEmpty',
+  'isNotEmpty',
+  'length',
+  'contains',
+  'join',
 
-    // From List.
-    'add',
-    'addAll',
-    'clear',
-    'fillRange',
-    'indexOf',
-    'insert',
-    'insertAll',
-    'lastIndexOf',
-    'remove',
-    'removeRange',
-    'replaceRange',
-    'setAll',
-    'setRange',
-    'shuffle',
-    '[]=',
+  // From List.
+  'add',
+  'addAll',
+  'clear',
+  'fillRange',
+  'indexOf',
+  'insert',
+  'insertAll',
+  'lastIndexOf',
+  'remove',
+  'removeRange',
+  'replaceRange',
+  'setAll',
+  'setRange',
+  'shuffle',
+  '[]=',
 
-    // From JSArray.
-    'checkMutable',
-    'checkGrowable',
-  ]);
+  // From JSArray.
+  'checkMutable',
+  'checkGrowable',
+]);
 
-Set<String> doesNotEscapeMapSet = new Set<String>.from(
-  const <String>[
-    // From Object.
-    '==',
-    'hashCode',
-    'toString',
-    'noSuchMethod',
-    'runtimeType',
-    // from Map.
-    'isEmpty',
-    'isNotEmpty',
-    'length',
-    'clear',
-    'containsKey',
-    'containsValue',
-    '[]=',
-    // [keys] only allows key values to escape, which we do not track.
-    'keys'
-  ]);
+Set<String> doesNotEscapeMapSet = new Set<String>.from(const <String>[
+  // From Object.
+  '==',
+  'hashCode',
+  'toString',
+  'noSuchMethod',
+  'runtimeType',
+  // from Map.
+  'isEmpty',
+  'isNotEmpty',
+  'length',
+  'clear',
+  'containsKey',
+  'containsValue',
+  '[]=',
+  // [keys] only allows key values to escape, which we do not track.
+  'keys'
+]);
 
+/// Common logic to trace a value through the type inference graph nodes.
 abstract class TracerVisitor<T extends TypeInformation>
     implements TypeInformationVisitor {
   final T tracedType;
@@ -75,8 +82,9 @@ abstract class TracerVisitor<T extends TypeInformation>
   static const int MAX_ANALYSIS_COUNT = 16;
   final Setlet<Element> analyzedElements = new Setlet<Element>();
 
-  TracerVisitor(this.tracedType, inferrer)
-      : this.inferrer = inferrer, this.compiler = inferrer.compiler;
+  TracerVisitor(this.tracedType, TypeGraphInferrerEngine inferrer)
+      : this.inferrer = inferrer,
+        this.compiler = inferrer.compiler;
 
   // Work list that gets populated with [TypeInformation] that could
   // contain the container.
@@ -85,8 +93,7 @@ abstract class TracerVisitor<T extends TypeInformation>
   // Work list of lists to analyze after analyzing the users of a
   // [TypeInformation]. We know the [tracedType] has been stored in these
   // lists and we must check how it escapes from these lists.
-  final List<ListTypeInformation> listsToAnalyze =
-      <ListTypeInformation>[];
+  final List<ListTypeInformation> listsToAnalyze = <ListTypeInformation>[];
   // Work list of maps to analyze after analyzing the users of a
   // [TypeInformation]. We know the [tracedType] has been stored in these
   // maps and we must check how it escapes from these maps.
@@ -138,10 +145,14 @@ abstract class TracerVisitor<T extends TypeInformation>
   }
 
   void bailout(String reason) {
-    if (_VERBOSE) {
+    if (debug.VERBOSE) {
       print('Bailing out on $tracedType because: $reason');
     }
     continueAnalyzing = false;
+  }
+
+  void visitAwaitTypeInformation(AwaitTypeInformation info) {
+    bailout("Passed through await");
   }
 
   void visitNarrowTypeInformation(NarrowTypeInformation info) {
@@ -173,9 +184,12 @@ abstract class TracerVisitor<T extends TypeInformation>
   void visitMapTypeInformation(MapTypeInformation info) {
     mapsToAnalyze.add(info);
   }
+
   void visitConcreteTypeInformation(ConcreteTypeInformation info) {}
 
   void visitStringLiteralTypeInformation(StringLiteralTypeInformation info) {}
+
+  void visitBoolLiteralTypeInformation(BoolLiteralTypeInformation info) {}
 
   void visitClosureTypeInformation(ClosureTypeInformation info) {}
 
@@ -196,9 +210,9 @@ abstract class TracerVisitor<T extends TypeInformation>
     } else {
       list.flowsInto.forEach((flow) {
         flow.users.forEach((user) {
-          if (user is !DynamicCallSiteTypeInformation) return;
+          if (user is! DynamicCallSiteTypeInformation) return;
           if (user.receiver != flow) return;
-          if (inferrer._returnsListElementTypeSet.contains(user.selector)) {
+          if (inferrer.returnsListElementTypeSet.contains(user.selector)) {
             addNewEscapeInformation(user);
           } else if (!doesNotEscapeListSet.contains(user.selector.name)) {
             bailout('Escape from a list via [${user.selector.name}]');
@@ -215,7 +229,7 @@ abstract class TracerVisitor<T extends TypeInformation>
     } else {
       map.flowsInto.forEach((flow) {
         flow.users.forEach((user) {
-          if (user is !DynamicCallSiteTypeInformation) return;
+          if (user is! DynamicCallSiteTypeInformation) return;
           if (user.receiver != flow) return;
           if (user.selector.isIndex) {
             addNewEscapeInformation(user);
@@ -238,9 +252,9 @@ abstract class TracerVisitor<T extends TypeInformation>
     if (!receiverType.isContainer) return false;
     String selectorName = info.selector.name;
     List<TypeInformation> arguments = info.arguments.positional;
-    return (selectorName == '[]=' && currentUser == arguments[1])
-        || (selectorName == 'insert' && currentUser == arguments[1])
-        || (selectorName == 'add' && currentUser == arguments[0]);
+    return (selectorName == '[]=' && currentUser == arguments[1]) ||
+        (selectorName == 'insert' && currentUser == arguments[1]) ||
+        (selectorName == 'add' && currentUser == arguments[0]);
   }
 
   bool isIndexSetOnMap(DynamicCallSiteTypeInformation info) {
@@ -256,8 +270,7 @@ abstract class TracerVisitor<T extends TypeInformation>
    * [isParameterOfMapAddingMethod].
    */
   bool isValueAddedToMap(DynamicCallSiteTypeInformation info) {
-     return isIndexSetOnMap(info) &&
-         currentUser == info.arguments.positional[1];
+    return isIndexSetOnMap(info) && currentUser == info.arguments.positional[1];
   }
 
   /**
@@ -266,8 +279,7 @@ abstract class TracerVisitor<T extends TypeInformation>
    * [isParameterOfMapAddingMethod].
    */
   bool isKeyAddedToMap(DynamicCallSiteTypeInformation info) {
-    return isIndexSetOnMap(info) &&
-        currentUser == info.arguments.positional[0];
+    return isIndexSetOnMap(info) && currentUser == info.arguments.positional[0];
   }
 
   void visitDynamicCallSiteTypeInformation(
@@ -301,7 +313,7 @@ abstract class TracerVisitor<T extends TypeInformation>
       bailout('Used as key in Map');
     }
 
-    if (info.targetsIncludeNoSuchMethod &&
+    if (info.targetsIncludeComplexNoSuchMethod(inferrer) &&
         info.arguments != null &&
         info.arguments.contains(currentUser)) {
       bailout('Passed to noSuchMethod');
@@ -326,9 +338,9 @@ abstract class TracerVisitor<T extends TypeInformation>
       return false;
     }
     Element method = element.enclosingElement;
-    return (method.name == '[]=')
-        || (method.name == 'add')
-        || (method.name == 'insert');
+    return (method.name == '[]=') ||
+        (method.name == 'add') ||
+        (method.name == 'insert');
   }
 
   /**
@@ -347,13 +359,13 @@ abstract class TracerVisitor<T extends TypeInformation>
 
   bool isClosure(Element element) {
     if (!element.isFunction) return false;
+
     /// Creating an instance of a class that implements [Function] also
     /// closurizes the corresponding [call] member. We do not currently
     /// track these, thus the check for [isClosurized] on such a method will
     /// return false. Instead we catch that case here for now.
     // TODO(herhut): Handle creation of closures from instances of Function.
-    if (element.isInstanceMember &&
-        element.name == Compiler.CALL_OPERATOR_NAME) {
+    if (element.isInstanceMember && element.name == Identifiers.call) {
       return true;
     }
     Element outermost = element.outermostEnclosingMemberOrTopLevel;
@@ -361,7 +373,6 @@ abstract class TracerVisitor<T extends TypeInformation>
   }
 
   void visitMemberTypeInformation(MemberTypeInformation info) {
-    Element element = info.element;
     if (info.isClosurized) {
       bailout('Returned from a closurized method');
     }

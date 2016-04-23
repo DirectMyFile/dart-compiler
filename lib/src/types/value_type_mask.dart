@@ -6,14 +6,12 @@ part of types;
 
 class ValueTypeMask extends ForwardingTypeMask {
   final TypeMask forwardTo;
-  final value;
+  final PrimitiveConstantValue value;
 
   ValueTypeMask(this.forwardTo, this.value);
 
   TypeMask nullable() {
-    return isNullable
-        ? this
-        : new ValueTypeMask(forwardTo.nullable(), value);
+    return isNullable ? this : new ValueTypeMask(forwardTo.nullable(), value);
   }
 
   TypeMask nonNullable() {
@@ -31,19 +29,17 @@ class ValueTypeMask extends ForwardingTypeMask {
 
   TypeMask intersection(TypeMask other, ClassWorld classWorld) {
     TypeMask forwardIntersection = forwardTo.intersection(other, classWorld);
-    if (forwardIntersection.isEmpty) return forwardIntersection;
-    return forwardIntersection.isNullable
-        ? nullable()
-        : nonNullable();
+    if (forwardIntersection.isEmptyOrNull) return forwardIntersection;
+    return forwardIntersection.isNullable ? nullable() : nonNullable();
   }
 
-  bool operator==(other) => super == other;
+  bool operator ==(other) => super == other;
 
   int get hashCode {
     return computeHashCode(value, isNullable, forwardTo);
   }
 
   String toString() {
-    return 'Value mask: [$value] type: $forwardTo';
+    return 'Value mask: [${value.unparse()}] type: $forwardTo';
   }
 }

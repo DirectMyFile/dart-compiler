@@ -14,44 +14,53 @@ export 'emptyset.dart';
 part 'indentation.dart';
 part 'link.dart';
 
-/// If an integer is masked by this constant, the result is guaranteed to be in
-/// Smi range.
-const int SMI_MASK = 0x3fffffff;
+/// Helper functions for creating hash codes.
+class Hashing {
+  /// If an integer is masked by this constant, the result is guaranteed to be
+  /// in Smi range.
+  static const int SMI_MASK = 0x3fffffff;
 
-/**
- * Tagging interface for classes from which source spans can be generated.
- */
-// TODO(johnniwinther): Find a better name.
-// TODO(ahe): How about "Bolt"?
-abstract class Spannable {}
+  /// Mix the bits of [value] and merge them with [existing].
+  static int mixHashCodeBits(int existing, int value) {
+    // Spread the bits of value. Try to stay in the 30-bit range to
+    // avoid overflowing into a more expensive integer representation.
+    int h = value & 0x1fffffff;
+    h += ((h & 0x3fff) << 15) ^ 0x1fffcd7d;
+    h ^= (h >> 10);
+    h += ((h & 0x3ffffff) << 3);
+    h ^= (h >> 6);
+    h += ((h & 0x7ffffff) << 2) + ((h & 0x7fff) << 14);
+    h ^= (h >> 16);
+    // Combine the two hash values.
+    int high = existing >> 15;
+    int low = existing & 0x7fff;
+    return ((high * 13) ^ (low * 997) ^ h) & SMI_MASK;
+  }
 
-class _SpannableSentinel implements Spannable {
-  final String name;
+  /// Mix the bits of `object.hashCode` with [existing].
+  static int objectHash(Object object, [int existing = 0]) {
+    return mixHashCodeBits(existing, object.hashCode);
+  }
 
-  const _SpannableSentinel(this.name);
+  /// Mix the bits of the element hash codes of [list] with [existing].
+  static int listHash(List list, [int existing = 0]) {
+    int h = existing;
+    int length = list.length;
+    for (int i = 0; i < length; i++) {
+      h = mixHashCodeBits(h, list[i].hashCode);
+    }
+    return h;
+  }
 
-  String toString() => name;
-}
-
-/// Sentinel spannable used to mark that diagnostics should point to the
-/// current element. Note that the diagnostic reporting will fail if the current
-/// element is `null`.
-const Spannable CURRENT_ELEMENT_SPANNABLE =
-    const _SpannableSentinel("Current element");
-
-/// Sentinel spannable used to mark that there might be no location for the
-/// diagnostic. Use this only when it is not an error not to have a current
-/// element.
-const Spannable NO_LOCATION_SPANNABLE =
-    const _SpannableSentinel("No location");
-
-class SpannableAssertionFailure {
-  final Spannable node;
-  final String message;
-  SpannableAssertionFailure(this.node, this.message);
-
-  String toString() => 'Assertion failure'
-                       '${message != null ? ': $message' : ''}';
+  /// Mix the bits of the key/value hash codes from [map] with [existing].
+  static int mapHash(Map map, [int existing = 0]) {
+    int h = existing;
+    for (var key in map.keys) {
+      h = mixHashCodeBits(h, key.hashCode);
+      h = mixHashCodeBits(h, map[key].hashCode);
+    }
+    return h;
+  }
 }
 
 bool equalElements(List a, List b) {
@@ -107,9 +116,9 @@ void writeJsonEscapedCharsOn(String string, buffer) {
       } else if (code == $LS) {
         // This Unicode line terminator and $PS are invalid in JS string
         // literals.
-        addCodeUnitEscaped(buffer, $LS);  // 0x2028.
+        addCodeUnitEscaped(buffer, $LS); // 0x2028.
       } else if (code == $PS) {
-        addCodeUnitEscaped(buffer, $PS);  // 0x2029.
+        addCodeUnitEscaped(buffer, $PS); // 0x2029.
       } else if (code == $BACKSLASH) {
         buffer.write(r'\\');
       } else {
@@ -134,8 +143,13 @@ void writeJsonEscapedCharsOn(String string, buffer) {
 
   for (int i = 0; i < string.length; i++) {
     int code = string.codeUnitAt(i);
-    if (code < 0x20 || code == $DEL || code == $DQ || code == $LS ||
-        code == $PS || code == $BACKSLASH || code >= 0x80) {
+    if (code < 0x20 ||
+        code == $DEL ||
+        code == $DQ ||
+        code == $LS ||
+        code == $PS ||
+        code == $BACKSLASH ||
+        code >= 0x80) {
       writeEscapedOn(string, buffer);
       return;
     }
@@ -144,20 +158,22 @@ void writeJsonEscapedCharsOn(String string, buffer) {
 }
 
 int computeHashCode(part1, [part2, part3, part4, part5]) {
-  return (part1.hashCode
-          ^ part2.hashCode
-          ^ part3.hashCode
-          ^ part4.hashCode
-          ^ part5.hashCode) & 0x3fffffff;
+  return (part1.hashCode ^
+          part2.hashCode ^
+          part3.hashCode ^
+          part4.hashCode ^
+          part5.hashCode) &
+      0x3fffffff;
 }
 
-String modifiersToString({bool isStatic: false,
-                          bool isAbstract: false,
-                          bool isFinal: false,
-                          bool isVar: false,
-                          bool isConst: false,
-                          bool isFactory: false,
-                          bool isExternal: false}) {
+String modifiersToString(
+    {bool isStatic: false,
+    bool isAbstract: false,
+    bool isFinal: false,
+    bool isVar: false,
+    bool isConst: false,
+    bool isFactory: false,
+    bool isExternal: false}) {
   LinkBuilder<String> builder = new LinkBuilder<String>();
   if (isStatic) builder.addLast('static');
   if (isAbstract) builder.addLast('abstract');
@@ -188,10 +204,9 @@ class Pair<A, B> {
   String toString() => '($a,$b)';
 }
 
-
 int longestCommonPrefixLength(List a, List b) {
   int index = 0;
-  for ( ; index < a.length && index < b.length; index++) {
+  for (; index < a.length && index < b.length; index++) {
     if (a[index] != b[index]) {
       break;
     }

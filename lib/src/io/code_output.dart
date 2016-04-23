@@ -6,21 +6,28 @@ library dart2js.code_output;
 
 import 'dart:async';
 
-import 'source_map_builder.dart';
+import 'source_information.dart';
 
-class CodeOutputMarker {
-  final int offsetDelta;
-  final SourceFileLocation sourcePosition;
-
-  CodeOutputMarker(this.offsetDelta, this.sourcePosition);
-}
-
+/// Listener interface for [CodeOutput] activity.
 abstract class CodeOutputListener {
+  /// Called when [text] is added to the output.
   void onText(String text);
+
+  /// Called when the output is closed with a final length of [length].
   void onDone(int length);
 }
 
-abstract class CodeOutput {
+/// Interface for a mapping of target offsets to source locations.
+abstract class SourceLocations {
+  /// Adds a [sourceLocation] at the specified [targetOffset].
+  void addSourceLocation(int targetOffset, SourceLocation sourcePosition);
+
+  /// Applies [f] to every target offset and associated source location.
+  void forEachSourceLocation(
+      void f(int targetOffset, SourceLocation sourceLocation));
+}
+
+abstract class CodeOutput implements SourceLocations {
   /// Write [text] to this output.
   ///
   /// If the output is closed, a [StateError] is thrown.
@@ -40,16 +47,10 @@ abstract class CodeOutput {
 
   /// Closes the output. Further writes will cause a [StateError].
   void close();
-
-  /// Applies [f] to every marker in this output.
-  void forEachSourceLocation(void f(int targetOffset,
-                                    SourceFileLocation sourceLocation));
 }
 
 abstract class AbstractCodeOutput extends CodeOutput {
-  List<CodeOutputMarker> markers = new List<CodeOutputMarker>();
-  int lastBufferOffset = 0;
-  int mappedRangeCounter = 0;
+  Map<int, List<SourceLocation>> markers = <int, List<SourceLocation>>{};
   bool isClosed = false;
 
   void _addInternal(String text);
@@ -59,22 +60,18 @@ abstract class AbstractCodeOutput extends CodeOutput {
     if (isClosed) {
       throw new StateError("Code output is closed. Trying to write '$text'.");
     }
-    if (mappedRangeCounter == 0) setSourceLocation(null);
     _addInternal(text);
   }
 
   @override
   void addBuffer(CodeBuffer other) {
     if (other.markers.length > 0) {
-      CodeOutputMarker firstMarker = other.markers[0];
-      int offsetDelta =
-          length + firstMarker.offsetDelta - lastBufferOffset;
-      markers.add(new CodeOutputMarker(offsetDelta,
-                                       firstMarker.sourcePosition));
-      for (int i = 1; i < other.markers.length; ++i) {
-        markers.add(other.markers[i]);
-      }
-      lastBufferOffset = length + other.lastBufferOffset;
+      other.markers
+          .forEach((int targetOffset, List<SourceLocation> sourceLocations) {
+        markers
+            .putIfAbsent(length + targetOffset, () => <SourceLocation>[])
+            .addAll(sourceLocations);
+      });
     }
     if (!other.isClosed) {
       other.close();
@@ -82,29 +79,18 @@ abstract class AbstractCodeOutput extends CodeOutput {
     _addInternal(other.getText());
   }
 
-  void beginMappedRange() {
-    ++mappedRangeCounter;
+  void addSourceLocation(int targetOffset, SourceLocation sourceLocation) {
+    assert(targetOffset <= length);
+    List<SourceLocation> sourceLocations =
+        markers.putIfAbsent(targetOffset, () => <SourceLocation>[]);
+    sourceLocations.add(sourceLocation);
   }
 
-  void endMappedRange() {
-    assert(mappedRangeCounter > 0);
-    --mappedRangeCounter;
-  }
-
-  void setSourceLocation(SourceFileLocation sourcePosition) {
-    if (sourcePosition == null) {
-      if (markers.length > 0 && markers.last.sourcePosition == null) return;
-    }
-    int offsetDelta = length - lastBufferOffset;
-    markers.add(new CodeOutputMarker(offsetDelta, sourcePosition));
-    lastBufferOffset = length;
-  }
-
-  void forEachSourceLocation(void f(int targetOffset, var sourcePosition)) {
-    int targetOffset = 0;
-    markers.forEach((marker) {
-      targetOffset += marker.offsetDelta;
-      f(targetOffset, marker.sourcePosition);
+  void forEachSourceLocation(void f(int targetOffset, var sourceLocation)) {
+    markers.forEach((int targetOffset, List<SourceLocation> sourceLocations) {
+      for (SourceLocation sourceLocation in sourceLocations) {
+        f(targetOffset, sourceLocation);
+      }
     });
   }
 
@@ -116,8 +102,12 @@ abstract class AbstractCodeOutput extends CodeOutput {
   }
 }
 
+abstract class BufferedCodeOutput {
+  String getText();
+}
+
 /// [CodeOutput] using a [StringBuffer] as backend.
-class CodeBuffer extends AbstractCodeOutput {
+class CodeBuffer extends AbstractCodeOutput implements BufferedCodeOutput {
   StringBuffer buffer = new StringBuffer();
 
   @override

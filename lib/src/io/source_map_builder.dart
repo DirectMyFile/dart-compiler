@@ -5,113 +5,28 @@
 library dart2js.source_map_builder;
 
 import '../util/util.dart';
-import '../scanner/scannerlib.dart' show Token;
 import '../util/uri_extras.dart' show relativize;
 import 'line_column_provider.dart';
-import 'source_file.dart';
+import 'source_information.dart' show SourceLocation;
 
 class SourceMapBuilder {
-  static const int VLQ_BASE_SHIFT = 5;
-  static const int VLQ_BASE_MASK = (1 << 5) - 1;
-  static const int VLQ_CONTINUATION_BIT = 1 << 5;
-  static const int VLQ_CONTINUATION_MASK = 1 << 5;
-  static const String BASE64_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn'
-                                      'opqrstuvwxyz0123456789+/';
+  /// The URI of the source map file.
+  final Uri sourceMapUri;
 
-  final Uri uri;
-  final Uri fileUri;
+  /// The URI of the target language file.
+  final Uri targetFileUri;
 
-  LineColumnProvider lineColumnProvider;
-  List<SourceMapEntry> entries;
+  final LineColumnProvider lineColumnProvider;
+  final List<SourceMapEntry> entries = new List<SourceMapEntry>();
 
-  Map<String, int> sourceUrlMap;
-  List<String> sourceUrlList;
-  Map<String, int> sourceNameMap;
-  List<String> sourceNameList;
+  SourceMapBuilder(
+      this.sourceMapUri, this.targetFileUri, this.lineColumnProvider);
 
-  int previousTargetLine;
-  int previousTargetColumn;
-  int previousSourceUrlIndex;
-  int previousSourceLine;
-  int previousSourceColumn;
-  int previousSourceNameIndex;
-  bool firstEntryInLine;
-
-  SourceMapBuilder(this.uri, this.fileUri, this.lineColumnProvider) {
-    entries = new List<SourceMapEntry>();
-
-    sourceUrlMap = new Map<String, int>();
-    sourceUrlList = new List<String>();
-    sourceNameMap = new Map<String, int>();
-    sourceNameList = new List<String>();
-
-    previousTargetLine = 0;
-    previousTargetColumn = 0;
-    previousSourceUrlIndex = 0;
-    previousSourceLine = 0;
-    previousSourceColumn = 0;
-    previousSourceNameIndex = 0;
-    firstEntryInLine = true;
-  }
-
-  resetPreviousSourceLocation() {
-    previousSourceUrlIndex = 0;
-    previousSourceLine = 0;
-    previousSourceColumn = 0;
-    previousSourceNameIndex = 0;
-  }
-
-  updatePreviousSourceLocation(SourceFileLocation sourceLocation) {
-    previousSourceLine = sourceLocation.getLine();
-    previousSourceColumn = sourceLocation.getColumn();
-    String sourceUrl = sourceLocation.getSourceUrl();
-    previousSourceUrlIndex = indexOf(sourceUrlList, sourceUrl, sourceUrlMap);
-    String sourceName = sourceLocation.getSourceName();
-    if (sourceName != null) {
-      previousSourceNameIndex =
-          indexOf(sourceNameList, sourceName, sourceNameMap);
-    }
-  }
-
-  bool sameAsPreviousLocation(SourceFileLocation sourceLocation) {
-    if (sourceLocation == null) {
-      return true;
-    }
-    int sourceUrlIndex =
-        indexOf(sourceUrlList, sourceLocation.getSourceUrl(), sourceUrlMap);
-    return
-       sourceUrlIndex == previousSourceUrlIndex &&
-       sourceLocation.getLine() == previousSourceLine &&
-       sourceLocation.getColumn() == previousSourceColumn;
-  }
-
-  void addMapping(int targetOffset, SourceFileLocation sourceLocation) {
-
-    bool sameLine(int position, otherPosition) {
-      return lineColumnProvider.getLine(position) ==
-                 lineColumnProvider.getLine(otherPosition);
-    }
-
-    if (!entries.isEmpty && sameLine(targetOffset, entries.last.targetOffset)) {
-      if (sameAsPreviousLocation(sourceLocation)) {
-        // The entry points to the same source location as the previous entry in
-        // the same line, hence it is not needed for the source map.
-        //
-        // TODO(zarah): Remove this check and make sure that [addMapping] is not
-        // called for this position. Instead, when consecutive lines in the
-        // generated code point to the same source location, record this and use
-        // it to generate the entries of the source map.
-        return;
-      }
-    }
-
-    if (sourceLocation != null) {
-      updatePreviousSourceLocation(sourceLocation);
-    }
+  void addMapping(int targetOffset, SourceLocation sourceLocation) {
     entries.add(new SourceMapEntry(sourceLocation, targetOffset));
   }
 
-  void printStringListOn(List<String> strings, StringBuffer buffer) {
+  void printStringListOn(Iterable<String> strings, StringBuffer buffer) {
     bool first = true;
     buffer.write('[');
     for (String string in strings) {
@@ -125,28 +40,63 @@ class SourceMapBuilder {
   }
 
   String build() {
-    resetPreviousSourceLocation();
-    StringBuffer mappingsBuffer = new StringBuffer();
-    entries.forEach((SourceMapEntry entry) {
-      writeEntry(entry, mappingsBuffer);
+    LineColumnMap<SourceMapEntry> lineColumnMap =
+        new LineColumnMap<SourceMapEntry>();
+    Map<Uri, LineColumnMap<SourceMapEntry>> sourceLocationMap =
+        <Uri, LineColumnMap<SourceMapEntry>>{};
+    entries.forEach((SourceMapEntry sourceMapEntry) {
+      int line = lineColumnProvider.getLine(sourceMapEntry.targetOffset);
+      int column =
+          lineColumnProvider.getColumn(line, sourceMapEntry.targetOffset);
+      lineColumnMap.add(line, column, sourceMapEntry);
+
+      SourceLocation location = sourceMapEntry.sourceLocation;
+      if (location != null) {
+        LineColumnMap<SourceMapEntry> sourceLineColumnMap =
+            sourceLocationMap.putIfAbsent(
+                location.sourceUri, () => new LineColumnMap<SourceMapEntry>());
+        sourceLineColumnMap.add(location.line, location.column, sourceMapEntry);
+      }
     });
+
+    return _build(lineColumnMap);
+  }
+
+  String _build(LineColumnMap<SourceMapEntry> lineColumnMap) {
+    IndexMap<Uri> uriMap = new IndexMap<Uri>();
+    IndexMap<String> nameMap = new IndexMap<String>();
+
+    lineColumnMap.forEachElement((SourceMapEntry entry) {
+      SourceLocation sourceLocation = entry.sourceLocation;
+      if (sourceLocation != null) {
+        uriMap.register(sourceLocation.sourceUri);
+        if (sourceLocation.sourceName != null) {
+          nameMap.register(sourceLocation.sourceName);
+        }
+      }
+    });
+
+    StringBuffer mappingsBuffer = new StringBuffer();
+    writeEntries(lineColumnMap, uriMap, nameMap, mappingsBuffer);
+
     StringBuffer buffer = new StringBuffer();
     buffer.write('{\n');
     buffer.write('  "version": 3,\n');
-    if (uri != null && fileUri != null) {
-      buffer.write('  "file": "${relativize(uri, fileUri, false)}",\n');
+    if (sourceMapUri != null && targetFileUri != null) {
+      buffer.write(
+          '  "file": "${relativize(sourceMapUri, targetFileUri, false)}",\n');
     }
     buffer.write('  "sourceRoot": "",\n');
     buffer.write('  "sources": ');
-    if (uri != null) {
-      sourceUrlList =
-          sourceUrlList.map((url) => relativize(uri, Uri.parse(url), false))
-              .toList();
+    Iterable<String> relativeSourceUriList = const <String>[];
+    if (sourceMapUri != null) {
+      relativeSourceUriList =
+          uriMap.elements.map((u) => relativize(sourceMapUri, u, false));
     }
-    printStringListOn(sourceUrlList, buffer);
+    printStringListOn(relativeSourceUriList, buffer);
     buffer.write(',\n');
     buffer.write('  "names": ');
-    printStringListOn(sourceNameList, buffer);
+    printStringListOn(nameMap.elements, buffer);
     buffer.write(',\n');
     buffer.write('  "mappings": "');
     buffer.write(mappingsBuffer);
@@ -154,118 +104,197 @@ class SourceMapBuilder {
     return buffer.toString();
   }
 
-  void writeEntry(SourceMapEntry entry, StringBuffer output) {
-    int targetLine = lineColumnProvider.getLine(entry.targetOffset);
-    int targetColumn =
-        lineColumnProvider.getColumn(targetLine, entry.targetOffset);
+  void writeEntries(LineColumnMap<SourceMapEntry> entries, IndexMap<Uri> uriMap,
+      IndexMap<String> nameMap, StringBuffer output) {
+    SourceLocation previousSourceLocation;
+    int previousTargetLine = 0;
+    DeltaEncoder targetColumnEncoder = new DeltaEncoder();
+    bool firstEntryInLine = true;
+    DeltaEncoder sourceUriIndexEncoder = new DeltaEncoder();
+    DeltaEncoder sourceLineEncoder = new DeltaEncoder();
+    DeltaEncoder sourceColumnEncoder = new DeltaEncoder();
+    DeltaEncoder sourceNameIndexEncoder = new DeltaEncoder();
 
-    if (targetLine > previousTargetLine) {
-      for (int i = previousTargetLine; i < targetLine; ++i) {
-        output.write(';');
+    entries.forEach((int targetLine, int targetColumn, SourceMapEntry entry) {
+      SourceLocation sourceLocation = entry.sourceLocation;
+      if (sourceLocation == previousSourceLocation) {
+        return;
       }
-      previousTargetLine = targetLine;
-      previousTargetColumn = 0;
-      firstEntryInLine = true;
-    }
 
-    if (!firstEntryInLine) {
-      output.write(',');
-    }
-    firstEntryInLine = false;
+      if (targetLine > previousTargetLine) {
+        for (int i = previousTargetLine; i < targetLine; ++i) {
+          output.write(';');
+        }
+        previousTargetLine = targetLine;
+        previousSourceLocation = null;
+        targetColumnEncoder.reset();
+        firstEntryInLine = true;
+      }
 
-    encodeVLQ(output, targetColumn - previousTargetColumn);
-    previousTargetColumn = targetColumn;
+      if (!firstEntryInLine) {
+        output.write(',');
+      }
+      firstEntryInLine = false;
 
-    if (entry.sourceLocation == null) return;
+      targetColumnEncoder.encode(output, targetColumn);
 
-    String sourceUrl = entry.sourceLocation.getSourceUrl();
-    int sourceLine = entry.sourceLocation.getLine();
-    int sourceColumn = entry.sourceLocation.getColumn();
-    String sourceName = entry.sourceLocation.getSourceName();
+      if (sourceLocation == null) {
+        return;
+      }
 
-    int sourceUrlIndex = indexOf(sourceUrlList, sourceUrl, sourceUrlMap);
-    encodeVLQ(output, sourceUrlIndex - previousSourceUrlIndex);
-    encodeVLQ(output, sourceLine - previousSourceLine);
-    encodeVLQ(output, sourceColumn - previousSourceColumn);
+      Uri sourceUri = sourceLocation.sourceUri;
+      sourceUriIndexEncoder.encode(output, uriMap[sourceUri]);
+      sourceLineEncoder.encode(output, sourceLocation.line);
+      sourceColumnEncoder.encode(output, sourceLocation.column);
 
-    if (sourceName != null) {
-      int sourceNameIndex = indexOf(sourceNameList, sourceName, sourceNameMap);
-      encodeVLQ(output, sourceNameIndex - previousSourceNameIndex);
-    }
+      String sourceName = sourceLocation.sourceName;
+      if (sourceName != null) {
+        sourceNameIndexEncoder.encode(output, nameMap[sourceName]);
+      }
 
-    // Update previous source location to ensure the next indices are relative
-    // to those if [entry.sourceLocation].
-    updatePreviousSourceLocation(entry.sourceLocation);
-  }
-
-  int indexOf(List<String> list, String value, Map<String, int> map) {
-    return map.putIfAbsent(value, () {
-      int index = list.length;
-      list.add(value);
-      return index;
+      previousSourceLocation = sourceLocation;
     });
   }
+}
 
-  static void encodeVLQ(StringBuffer output, int value) {
+/// Encoder for value deltas in VLQ format.
+class DeltaEncoder {
+  /// The last emitted value of the encoder.
+  int _value = 0;
+
+  /// Reset the encoder to its initial state.
+  void reset() {
+    _value = 0;
+  }
+
+  /// Writes the VLQ of delta between [value] and the last emitted value into
+  /// [output] and updates the last emitted value of the encoder.
+  void encode(StringBuffer output, int value) {
+    _value = encodeVLQ(output, value, _value);
+  }
+
+  static const int VLQ_BASE_SHIFT = 5;
+  static const int VLQ_BASE_MASK = (1 << 5) - 1;
+  static const int VLQ_CONTINUATION_BIT = 1 << 5;
+  static const int VLQ_CONTINUATION_MASK = 1 << 5;
+  static const String BASE64_DIGITS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmn'
+      'opqrstuvwxyz0123456789+/';
+
+  /// Writes the VLQ of delta between [value] and [offset] into [output] and
+  /// return [value].
+  static int encodeVLQ(StringBuffer output, int value, int offset) {
+    int delta = value - offset;
     int signBit = 0;
-    if (value < 0) {
+    if (delta < 0) {
       signBit = 1;
-      value = -value;
+      delta = -delta;
     }
-    value = (value << 1) | signBit;
+    delta = (delta << 1) | signBit;
     do {
-      int digit = value & VLQ_BASE_MASK;
-      value >>= VLQ_BASE_SHIFT;
-      if (value > 0) {
+      int digit = delta & VLQ_BASE_MASK;
+      delta >>= VLQ_BASE_SHIFT;
+      if (delta > 0) {
         digit |= VLQ_CONTINUATION_BIT;
       }
       output.write(BASE64_DIGITS[digit]);
-    } while (value > 0);
+    } while (delta > 0);
+    return value;
   }
 }
 
 class SourceMapEntry {
-  SourceFileLocation sourceLocation;
+  SourceLocation sourceLocation;
   int targetOffset;
 
   SourceMapEntry(this.sourceLocation, this.targetOffset);
 }
 
-abstract class SourceFileLocation {
-  SourceFile sourceFile;
+/// Map from line/column pairs to lists of [T] elements.
+class LineColumnMap<T> {
+  Map<int, Map<int, List<T>>> _map = <int, Map<int, List<T>>>{};
 
-  SourceFileLocation(this.sourceFile) {
-    assert(isValid());
+  /// Returns the list of elements associated with ([line],[column]).
+  List<T> _getList(int line, int column) {
+    Map<int, List<T>> lineMap = _map.putIfAbsent(line, () => <int, List<T>>{});
+    return lineMap.putIfAbsent(column, () => <T>[]);
   }
 
-  int line;
-
-  int get offset;
-
-  String getSourceUrl() => sourceFile.filename;
-
-  int getLine() {
-    if (line == null) line = sourceFile.getLine(offset);
-    return line;
+  /// Adds [element] to the end of the list of elements associated with
+  /// ([line],[column]).
+  void add(int line, int column, T element) {
+    _getList(line, column).add(element);
   }
 
-  int getColumn() => sourceFile.getColumn(getLine(), offset);
+  /// Adds [element] to the beginning of the list of elements associated with
+  /// ([line],[column]).
+  void addFirst(int line, int column, T element) {
+    _getList(line, column).insert(0, element);
+  }
 
-  String getSourceName();
+  /// Calls [f] with the line number for each line with associated elements.
+  ///
+  /// [f] is called in increasing line order.
+  void forEachLine(f(int line)) {
+    List<int> lines = _map.keys.toList()..sort();
+    lines.forEach(f);
+  }
 
-  bool isValid() => offset < sourceFile.length;
+  /// Returns the elements for the first the column in [line] that has
+  /// associated elements.
+  List<T> getFirstElementsInLine(int line) {
+    Map<int, List<T>> lineMap = _map[line];
+    if (lineMap == null) return null;
+    List<int> columns = lineMap.keys.toList()..sort();
+    return lineMap[columns.first];
+  }
+
+  /// Calls [f] for each column with associated elements in [line].
+  ///
+  /// [f] is called in increasing column order.
+  void forEachColumn(int line, f(int column, List<T> elements)) {
+    Map<int, List<T>> lineMap = _map[line];
+    if (lineMap != null) {
+      List<int> columns = lineMap.keys.toList()..sort();
+      columns.forEach((int column) {
+        f(column, lineMap[column]);
+      });
+    }
+  }
+
+  /// Calls [f] for each line/column/element triplet in the map.
+  ///
+  /// [f] is called in increasing line, column, element order.
+  void forEach(f(int line, int column, T element)) {
+    List<int> lines = _map.keys.toList()..sort();
+    for (int line in lines) {
+      Map<int, List<T>> lineMap = _map[line];
+      List<int> columns = lineMap.keys.toList()..sort();
+      for (int column in columns) {
+        lineMap[column].forEach((e) => f(line, column, e));
+      }
+    }
+  }
+
+  /// Calls [f] for each element associated in the map.
+  ///
+  /// [f] is called in increasing line, column, element order.
+  void forEachElement(f(T element)) {
+    forEach((line, column, element) => f(element));
+  }
 }
 
-class TokenSourceFileLocation extends SourceFileLocation {
-  final Token token;
-  final String name;
+/// Map from [T] elements to assigned indices.
+class IndexMap<T> {
+  Map<T, int> map = <T, int>{};
 
-  TokenSourceFileLocation(SourceFile sourceFile, this.token, this.name)
-    : super(sourceFile);
-
-  int get offset => token.charOffset;
-
-  String getSourceName() {
-    return name;
+  /// Register [element] and returns its index.
+  int register(T element) {
+    return map.putIfAbsent(element, () => map.length);
   }
+
+  /// Returns the index of [element].
+  int operator [](T element) => map[element];
+
+  /// Returns the indexed elements.
+  Iterable<T> get elements => map.keys;
 }

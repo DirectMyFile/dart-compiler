@@ -8,7 +8,8 @@ typedef bool IsSafeToRemoveTypeDeclarations(
     Map<ClassElement, Iterable<Element>> classMembers);
 typedef void ElementCallback<E>(E element);
 typedef void ElementPostProcessFunction(
-    AstElement element, ElementAst elementAst,
+    AstElement element,
+    ElementAst elementAst,
     ElementCallback<TypedefElement> typedefCallback,
     ElementCallback<ClassElement> classCallback);
 typedef ElementAst ComputeElementAstFunction(AstElement element);
@@ -18,7 +19,7 @@ typedef List<Element> ElementSorter(Iterable<Element> elements);
 /// Output engine for dart2dart that is shared between the dart2js and the
 /// analyzer implementations of dart2dart.
 class DartOutputter {
-  final DiagnosticListener listener;
+  final DiagnosticReporter reporter;
   final CompilerOutputProvider outputProvider;
   final bool forceStripTypes;
 
@@ -37,10 +38,10 @@ class DartOutputter {
   ElementInfo elementInfo;
 
   // TODO(johnniwinther): Support recompilation.
-  DartOutputter(this.listener, this.outputProvider,
-                {bool this.forceStripTypes: false,
-                 bool this.enableMinification: false,
-                 bool this.multiFile: false});
+  DartOutputter(this.reporter, this.outputProvider,
+      {bool this.forceStripTypes: false,
+      bool this.enableMinification: false,
+      bool this.multiFile: false});
 
   /// Generate Dart code for the program starting at [mainFunction].
   ///
@@ -57,8 +58,8 @@ class DartOutputter {
   /// [resolvedElements] in the generated output.
   ///
   /// Returns the total size of the generated code.
-  int assembleProgram({
-      MirrorRenamer mirrorRenamer: const MirrorRenamer(),
+  int assembleProgram(
+      {MirrorRenamer mirrorRenamer: const MirrorRenamer(),
       Iterable<LibraryElement> libraries,
       Iterable<Element> instantiatedClasses,
       Iterable<Element> resolvedElements,
@@ -70,7 +71,6 @@ class DartOutputter {
       ElementFilter shouldOutput,
       IsSafeToRemoveTypeDeclarations isSafeToRemoveTypeDeclarations,
       ElementSorter sortElements}) {
-
     assert(invariant(NO_LOCATION_SPANNABLE, libraries != null,
         message: "'libraries' must be non-null."));
     assert(invariant(NO_LOCATION_SPANNABLE, instantiatedClasses != null,
@@ -83,8 +83,8 @@ class DartOutputter {
         message: "'computeElementAst' must be non-null."));
     assert(invariant(NO_LOCATION_SPANNABLE, shouldOutput != null,
         message: "'shouldOutput' must be non-null."));
-    assert(invariant(NO_LOCATION_SPANNABLE,
-        isSafeToRemoveTypeDeclarations != null,
+    assert(invariant(
+        NO_LOCATION_SPANNABLE, isSafeToRemoveTypeDeclarations != null,
         message: "'isSafeToRemoveTypeDeclarations' must be non-null."));
 
     if (sortElements == null) {
@@ -96,49 +96,34 @@ class DartOutputter {
       };
     }
 
-    libraryInfo = LibraryInfo.processLibraries(libraries, resolvedElements);
+    libraryInfo =
+        LibraryInfo.processLibraries(reporter, libraries, resolvedElements);
 
     elementInfo = ElementInfoProcessor.createElementInfo(
-        instantiatedClasses,
-        resolvedElements,
-        usedTypeLiterals,
+        instantiatedClasses, resolvedElements, usedTypeLiterals,
         postProcessElementAst: postProcessElementAst,
         parseElementAst: computeElementAst,
         shouldOutput: shouldOutput,
         sortElements: sortElements);
 
     PlaceholderCollector collector = collectPlaceholders(
-        listener,
-        mirrorRenamer,
-        mainFunction,
-        libraryInfo,
-        elementInfo);
+        reporter, mirrorRenamer, mainFunction, libraryInfo, elementInfo);
 
-    renamer = createRenamer(
-        collector,
-        libraryInfo,
-        elementInfo,
+    renamer = createRenamer(collector, libraryInfo, elementInfo,
         enableMinification: enableMinification,
         forceStripTypes: forceStripTypes,
         isSafeToRemoveTypeDeclarations: isSafeToRemoveTypeDeclarations);
 
     if (outputAst) {
-      String code = astOutput(listener, elementInfo);
+      String code = astOutput(reporter, elementInfo);
       outputProvider("", "dart")
-                 ..add(code)
-                 ..close();
+        ..add(code)
+        ..close();
       return code.length;
     } else {
       output = new MainOutputGenerator();
-      return output.generateCode(
-          libraryInfo,
-          elementInfo,
-          collector,
-          renamer,
-          mainFunction,
-          outputUri,
-          outputProvider,
-          mirrorRenamer,
+      return output.generateCode(libraryInfo, elementInfo, collector, renamer,
+          mainFunction, outputUri, outputProvider, mirrorRenamer,
           multiFile: multiFile,
           forceStripTypes: forceStripTypes,
           enableMinification: enableMinification);
@@ -146,14 +131,14 @@ class DartOutputter {
   }
 
   static PlaceholderCollector collectPlaceholders(
-      DiagnosticListener listener,
+      DiagnosticReporter reporter,
       MirrorRenamer mirrorRenamer,
       FunctionElement mainFunction,
       LibraryInfo libraryInfo,
       ElementInfo elementInfo) {
     // Create all necessary placeholders.
     PlaceholderCollector collector = new PlaceholderCollector(
-        listener,
+        reporter,
         mirrorRenamer,
         libraryInfo.fixedDynamicNames,
         elementInfo.elementAsts,
@@ -162,7 +147,7 @@ class DartOutputter {
     makePlaceholders(element) {
       collector.collect(element);
 
-      if (element.isClass) {
+      if (element.isClass && !element.isEnumClass) {
         elementInfo.classMembers[element].forEach(makePlaceholders);
       }
     }
@@ -170,17 +155,15 @@ class DartOutputter {
     return collector;
   }
 
-  static PlaceholderRenamer createRenamer(
-      PlaceholderCollector collector,
-      LibraryInfo libraryInfo,
-      ElementInfo elementInfo,
+  static PlaceholderRenamer createRenamer(PlaceholderCollector collector,
+      LibraryInfo libraryInfo, ElementInfo elementInfo,
       {bool enableMinification: false,
-       bool forceStripTypes: false,
-       isSafeToRemoveTypeDeclarations}) {
+      bool forceStripTypes: false,
+      isSafeToRemoveTypeDeclarations}) {
     // Create renames.
-    bool shouldCutDeclarationTypes = forceStripTypes
-        || (enableMinification
-            && isSafeToRemoveTypeDeclarations(elementInfo.classMembers));
+    bool shouldCutDeclarationTypes = forceStripTypes ||
+        (enableMinification &&
+            isSafeToRemoveTypeDeclarations(elementInfo.classMembers));
 
     PlaceholderRenamer placeholderRenamer = new PlaceholderRenamer(
         libraryInfo.fixedDynamicNames,
@@ -193,13 +176,13 @@ class DartOutputter {
     return placeholderRenamer;
   }
 
-  static String astOutput(DiagnosticListener listener,
-                          ElementInfo elementInfo) {
+  static String astOutput(
+      DiagnosticReporter reporter, ElementInfo elementInfo) {
     // TODO(antonm): Ideally XML should be a separate backend.
     // TODO(antonm): obey renames and minification, at least as an option.
     StringBuffer sb = new StringBuffer();
     outputElement(element) {
-      sb.write(element.parseNode(listener).toDebugString());
+      sb.write(element.parseNode(reporter).toDebugString());
     }
 
     // Emit XML for AST instead of the program.
@@ -222,18 +205,17 @@ class LibraryInfo {
   final Map<Element, LibraryElement> reexportingLibraries;
   final List<LibraryElement> userLibraries;
 
-  LibraryInfo(this.fixedStaticNames,
-              this.fixedDynamicNames,
-              this.reexportingLibraries,
-              this.userLibraries);
+  LibraryInfo(this.fixedStaticNames, this.fixedDynamicNames,
+      this.reexportingLibraries, this.userLibraries);
 
   static LibraryInfo processLibraries(
+      DiagnosticReporter reporter,
       Iterable<LibraryElement> libraries,
       Iterable<AstElement> resolvedElements) {
     Set<String> fixedStaticNames = new Set<String>();
     Set<String> fixedDynamicNames = new Set<String>();
     Map<Element, LibraryElement> reexportingLibraries =
-          <Element, LibraryElement>{};
+        <Element, LibraryElement>{};
     List<LibraryElement> userLibraries = <LibraryElement>[];
     // Conservatively traverse all platform libraries and collect member names.
     // TODO(antonm): ideally we should only collect names of used members,
@@ -265,34 +247,58 @@ class LibraryInfo {
         fixedStaticNames.add(element.name);
       });
 
-      for (Element export in library.exports) {
-        if (!library.isInternalLibrary &&
-            export.library.isInternalLibrary) {
+      library.forEachExport((Element export) {
+        if (!library.isInternalLibrary && export.library.isInternalLibrary) {
           // If an element of an internal library is reexported by a platform
           // library, we have to import the reexporting library instead of the
           // internal library, because the internal library is an
           // implementation detail of dart2js.
           reexportingLibraries[export] = library;
         }
-      }
+      });
     }
+
+    // Map to keep track of names of enum classes. Since these cannot be renamed
+    // we ensure that they are unique.
+    Map<String, ClassElement> enumClassMap = <String, ClassElement>{};
+
     // As of now names of named optionals are not renamed. Therefore add all
     // field names used as named optionals into [fixedMemberNames].
     for (final element in resolvedElements) {
       if (!element.isConstructor) continue;
-      Link<Element> optionalParameters =
-          element.functionSignature.optionalParameters;
-      for (final optional in optionalParameters) {
-        if (!optional.isInitializingFormal) continue;
-        fixedDynamicNames.add(optional.name);
+      for (ParameterElement parameter in element.parameters) {
+        if (parameter.isInitializingFormal && parameter.isNamed) {
+          fixedDynamicNames.add(parameter.name);
+        }
+      }
+      ClassElement cls = element.enclosingClass;
+      if (cls != null && cls.isEnumClass) {
+        fixedDynamicNames.add('index');
+
+        ClassElement existingEnumClass =
+            enumClassMap.putIfAbsent(cls.name, () => cls);
+        if (existingEnumClass != cls) {
+          reporter.reportError(
+              reporter.createMessage(cls, MessageKind.GENERIC, {
+                'text': "Duplicate enum names are not supported "
+                    "in dart2dart."
+              }),
+              <DiagnosticMessage>[
+                reporter.createMessage(existingEnumClass, MessageKind.GENERIC, {
+                  'text': "This is the other declaration of '${cls.name}'."
+                }),
+              ]);
+        }
       }
     }
+
+    fixedStaticNames.addAll(enumClassMap.keys);
+
     // The VM will automatically invoke the call method of objects
     // that are invoked as functions. Make sure to not rename that.
     fixedDynamicNames.add('call');
 
-    return new LibraryInfo(
-        fixedStaticNames, fixedDynamicNames,
+    return new LibraryInfo(fixedStaticNames, fixedDynamicNames,
         reexportingLibraries, userLibraries);
   }
 }
@@ -303,10 +309,8 @@ class ElementInfo {
   final Map<ClassElement, Iterable<Element>> classMembers;
   final Iterable<ClassElement> emitNoMembersFor;
 
-  ElementInfo(this.elementAsts,
-              this.topLevelElements,
-              this.classMembers,
-              this.emitNoMembersFor);
+  ElementInfo(this.elementAsts, this.topLevelElements, this.classMembers,
+      this.emitNoMembersFor);
 }
 
 class ElementInfoProcessor implements ElementInfo {
@@ -320,18 +324,16 @@ class ElementInfoProcessor implements ElementInfo {
   final ElementFilter shouldOutput;
 
   ElementInfoProcessor(
-      {this.postProcessElementAst,
-       this.parseElementAst,
-       this.shouldOutput});
+      {this.postProcessElementAst, this.parseElementAst, this.shouldOutput});
 
   static ElementInfo createElementInfo(
       Iterable<ClassElement> instantiatedClasses,
       Iterable<AstElement> resolvedElements,
       Iterable<ClassElement> usedTypeLiterals,
       {ElementPostProcessFunction postProcessElementAst,
-       ComputeElementAstFunction parseElementAst,
-       ElementFilter shouldOutput,
-       ElementSorter sortElements}) {
+      ComputeElementAstFunction parseElementAst,
+      ElementFilter shouldOutput,
+      ElementSorter sortElements}) {
     ElementInfoProcessor processor = new ElementInfoProcessor(
         postProcessElementAst: postProcessElementAst,
         parseElementAst: parseElementAst,
@@ -341,10 +343,11 @@ class ElementInfoProcessor implements ElementInfo {
         sortElements: sortElements);
   }
 
-  ElementInfo process(Iterable<ClassElement> instantiatedClasses,
-                      Iterable<AstElement> resolvedElements,
-                      Iterable<ClassElement> usedTypeLiterals,
-                      {ElementSorter sortElements}) {
+  ElementInfo process(
+      Iterable<ClassElement> instantiatedClasses,
+      Iterable<AstElement> resolvedElements,
+      Iterable<ClassElement> usedTypeLiterals,
+      {ElementSorter sortElements}) {
     // Build all top level elements to emit and necessary class members.
     instantiatedClasses.where(shouldOutput).forEach(addClass);
     resolvedElements.where(shouldOutput).forEach(addMember);
@@ -372,9 +375,8 @@ class ElementInfoProcessor implements ElementInfo {
 
   void processElement(Element element, ElementAst elementAst) {
     if (postProcessElementAst != null) {
-      postProcessElementAst(element, elementAst,
-                            newTypedefElementCallback,
-                            newClassElementCallback);
+      postProcessElementAst(element, elementAst, newTypedefElementCallback,
+          newClassElementCallback);
     }
     elementAsts[element] = elementAst;
   }
@@ -409,18 +411,17 @@ class ElementInfoProcessor implements ElementInfo {
   }
 
   void addMember(element) {
-    ElementAst elementAst = parseElementAst(element);
     if (element.isClassMember) {
       ClassElement enclosingClass = element.enclosingClass;
       assert(enclosingClass.isClass);
-      assert(enclosingClass.isTopLevel);
       assert(shouldOutput(enclosingClass));
       addClass(enclosingClass);
       classMembers[enclosingClass].add(element);
-      processElement(element, elementAst);
+      if (enclosingClass.isEnumClass) return;
+      processElement(element, parseElementAst(element));
     } else {
       if (element.isTopLevel) {
-        addTopLevel(element, elementAst);
+        addTopLevel(element, parseElementAst(element));
       }
     }
   }
@@ -430,7 +431,7 @@ class ElementInfoProcessor implements ElementInfo {
 /// [CompilerOutputProvider].
 class MainOutputGenerator {
   final Map<ClassNode, List<Node>> memberNodes =
-       new Map<ClassNode, List<Node>>();
+      new Map<ClassNode, List<Node>>();
   final List<Node> topLevelNodes = <Node>[];
 
   /// Generates the code and returns the total size.
@@ -444,21 +445,25 @@ class MainOutputGenerator {
       CompilerOutputProvider outputProvider,
       MirrorRenamer mirrorRenamer,
       {bool multiFile: false,
-       bool forceStripTypes: false,
-       bool enableMinification: false}) {
+      bool forceStripTypes: false,
+      bool enableMinification: false}) {
     for (Element element in elementInfo.topLevelElements) {
       topLevelNodes.add(elementInfo.elementAsts[element].ast);
-      if (element.isClass && !element.isMixinApplication) {
+      if (element.isClass) {
+        ClassElement cls = element;
+        if (cls.isMixinApplication || cls.isEnumClass) {
+          continue;
+        }
         final members = <Node>[];
-        for (Element member in elementInfo.classMembers[element]) {
+        for (Element member in elementInfo.classMembers[cls]) {
           members.add(elementInfo.elementAsts[member].ast);
         }
-        memberNodes[elementInfo.elementAsts[element].ast] = members;
+        memberNodes[elementInfo.elementAsts[cls].ast] = members;
       }
     }
 
-    mirrorRenamer.addRenames(placeholderRenamer.renames,
-                             topLevelNodes, collector);
+    mirrorRenamer.addRenames(
+        placeholderRenamer.renames, topLevelNodes, collector);
 
     Map<LibraryElement, String> outputPaths = new Map<LibraryElement, String>();
     Map<LibraryElement, EmitterUnparser> unparsers =
@@ -468,8 +473,7 @@ class MainOutputGenerator {
     EmitterUnparser mainUnparser = multiFile
         ? null
         : new EmitterUnparser(placeholderRenamer.renames,
-            stripTypes: forceStripTypes,
-            minify: enableMinification);
+            stripTypes: forceStripTypes, minify: enableMinification);
 
     if (multiFile) {
       // TODO(sigurdm): Factor handling of library-paths out from emitting.
@@ -478,7 +482,7 @@ class MainOutputGenerator {
           ? mainName.substring(0, mainName.length - 5)
           : mainName;
       // Map each library to a path based on the uri of the original
-      // library and [compiler.outputUri].
+      // library and [compiler.options.outputUri].
       Set<String> usedLibraryPaths = new Set<String>();
       for (LibraryElement library in libraryInfo.userLibraries) {
         if (library == mainFunction.library) {
@@ -495,34 +499,33 @@ class MainOutputGenerator {
       }
 
       /// Rewrites imports/exports to refer to the paths given in [outputPaths].
-      for(LibraryElement outputLibrary in libraryInfo.userLibraries) {
+      for (LibraryElement outputLibrary in libraryInfo.userLibraries) {
         EmitterUnparser unparser = new EmitterUnparser(
             placeholderRenamer.renames,
             stripTypes: forceStripTypes,
             minify: enableMinification);
         unparsers[outputLibrary] = unparser;
-        LibraryName libraryName = outputLibrary.libraryTag;
-        if (libraryName != null) {
-          unparser.visitLibraryName(libraryName);
+        if (outputLibrary.hasLibraryName) {
+          unparser.unparseLibraryName(outputLibrary.libraryName);
         }
-        for (LibraryTag tag in outputLibrary.tags) {
-          if (tag is! LibraryDependency) continue;
-          LibraryDependency dependency = tag;
-          LibraryElement libraryElement =
-              outputLibrary.getLibraryFromTag(dependency);
+        for (ImportElement import in outputLibrary.imports) {
+          LibraryElement libraryElement = import.importedLibrary;
           String uri = outputPaths.containsKey(libraryElement)
               ? "${outputPaths[libraryElement]}.dart"
               : libraryElement.canonicalUri.toString();
-          if (dependency is Import) {
-            unparser.unparseImportTag(uri);
-          } else {
-            unparser.unparseExportTag(uri);
-          }
+          unparser.unparseImportTag(uri);
+        }
+        for (ExportElement export in outputLibrary.exports) {
+          LibraryElement libraryElement = export.exportedLibrary;
+          String uri = outputPaths.containsKey(libraryElement)
+              ? "${outputPaths[libraryElement]}.dart"
+              : libraryElement.canonicalUri.toString();
+          unparser.unparseExportTag(uri);
         }
       }
     } else {
-      placeholderRenamer.platformImports.forEach(
-          (LibraryElement library, String prefix) {
+      placeholderRenamer.platformImports
+          .forEach((LibraryElement library, String prefix) {
         assert(library.isPlatformLibrary && !library.isInternalLibrary);
         mainUnparser.unparseImportTag(library.canonicalUri.toString());
         if (prefix != null) {
@@ -530,7 +533,7 @@ class MainOutputGenerator {
           // it to avoid shadowing.
           // TODO(johnniwinther): Avoid prefix-less import if not needed.
           mainUnparser.unparseImportTag(library.canonicalUri.toString(),
-                                        prefix: prefix);
+              prefix: prefix);
         }
       });
     }
@@ -550,20 +553,20 @@ class MainOutputGenerator {
 
     int totalSize = 0;
     if (multiFile) {
-      for(LibraryElement outputLibrary in libraryInfo.userLibraries) {
+      for (LibraryElement outputLibrary in libraryInfo.userLibraries) {
         // TODO(sigurdm): Make the unparser output directly into the buffer
         // instead of caching in `.result`.
         String code = unparsers[outputLibrary].result;
         totalSize += code.length;
         outputProvider(outputPaths[outputLibrary], "dart")
-             ..add(code)
-             ..close();
+          ..add(code)
+          ..close();
       }
     } else {
       String code = mainUnparser.result;
       outputProvider("", "dart")
-           ..add(code)
-           ..close();
+        ..add(code)
+        ..close();
 
       totalSize = code.length;
     }

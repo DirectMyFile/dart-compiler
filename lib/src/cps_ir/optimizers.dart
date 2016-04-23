@@ -4,51 +4,65 @@
 
 library dart2js.cps_ir.optimizers;
 
-import '../constants/expressions.dart' show
-    ConstantExpression,
-    PrimitiveConstantExpression;
-import '../constants/values.dart';
-import '../dart_types.dart' as types;
-import '../dart2jslib.dart' as dart2js;
-import '../tree/tree.dart' show LiteralDartString;
-import '../util/util.dart';
 import 'cps_ir_nodes.dart';
-import '../types/types.dart' show TypeMask, TypesTask;
-import '../types/constants.dart' show computeTypeMask;
-import '../elements/elements.dart' show ClassElement, Element, Entity,
-    FieldElement, FunctionElement, ParameterElement;
-import '../dart2jslib.dart' show ClassWorld;
+import '../constants/values.dart';
+import '../common/names.dart';
+import '../universe/selector.dart';
 
-part 'type_propagation.dart';
-part 'redundant_phi.dart';
-part 'shrinking_reductions.dart';
+export 'type_propagation.dart' show TypePropagator;
+export 'scalar_replacement.dart' show ScalarReplacer;
+export 'redundant_phi.dart' show RedundantPhiEliminator;
+export 'redundant_join.dart' show RedundantJoinEliminator;
+export 'shrinking_reductions.dart' show ShrinkingReducer;
+export 'mutable_ssa.dart' show MutableVariableEliminator;
+export 'insert_refinements.dart' show InsertRefinements;
+export 'update_refinements.dart' show UpdateRefinements;
+export 'redundant_refinement.dart' show RedundantRefinementEliminator;
+export 'optimize_interceptors.dart' show OptimizeInterceptors;
+export 'bounds_checker.dart' show BoundsChecker;
+export 'backward_null_check_remover.dart' show BackwardNullCheckRemover;
+export 'gvn.dart' show GVN;
+export 'inline.dart' show Inliner;
+export 'eagerly_load_statics.dart' show EagerlyLoadStatics;
+export 'loop_invariant_branch.dart' show LoopInvariantBranchMotion;
+export 'path_based_optimizer.dart' show PathBasedOptimizer;
+export 'use_field_initializers.dart' show UseFieldInitializers;
+export 'parent_visitor.dart' show ParentVisitor;
 
 /// An optimization pass over the CPS IR.
 abstract class Pass {
   /// Applies optimizations to root, rewriting it in the process.
-  void rewrite(ExecutableDefinition root) => root.applyPass(this);
+  void rewrite(FunctionDefinition root);
 
-  void rewriteConstructorDefinition(ConstructorDefinition root);
-  void rewriteFunctionDefinition(FunctionDefinition root);
-  void rewriteFieldDefinition(FieldDefinition root);
+  String get passName;
 }
 
-abstract class PassMixin implements Pass {
-  void rewrite(ExecutableDefinition root) => root.applyPass(this);
+// Shared code between optimizations
 
-  void rewriteExecutableDefinition(ExecutableDefinition root);
-
-  void rewriteFunctionDefinition(FunctionDefinition root) {
-    if (root.isAbstract) return;
-    rewriteExecutableDefinition(root);
-  }
-
-  void rewriteConstructorDefinition(ConstructorDefinition root) {
-    if (root.isAbstract) return;
-    rewriteExecutableDefinition(root);
-  }
-  void rewriteFieldDefinition(FieldDefinition root) {
-    if (!root.hasInitializer) return;
-    rewriteExecutableDefinition(root);
-  }
+/// Returns true if [value] is false, null, 0, -0, NaN, or the empty string.
+bool isFalsyConstant(ConstantValue value) {
+  return value.isFalse ||
+      value.isNull ||
+      value.isZero ||
+      value.isMinusZero ||
+      value.isNaN ||
+      value is StringConstantValue && value.primitiveValue.isEmpty;
 }
+
+/// Returns true if [value] satisfies a branching condition with the
+/// given strictness.
+///
+/// For non-strict, this is the opposite of [isFalsyConstant].
+bool isTruthyConstant(ConstantValue value, {bool strict: false}) {
+  return strict ? value.isTrue : !isFalsyConstant(value);
+}
+
+/// Selectors that do not throw when invoked on the null value.
+final List<Selector> selectorsOnNull = <Selector>[
+  Selectors.equals,
+  Selectors.hashCode_,
+  Selectors.runtimeType_,
+  Selectors.toString_,
+  Selectors.toStringGetter,
+  Selectors.noSuchMethodGetter
+];

@@ -2,7 +2,10 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of resolution;
+library dart2js.resolution.scope;
+
+import '../dart_types.dart';
+import '../elements/elements.dart';
 
 abstract class Scope {
   /**
@@ -18,7 +21,8 @@ abstract class Scope {
 
   static Scope buildEnclosingScope(Element element) {
     return element.enclosingElement != null
-        ? element.enclosingElement.buildScope() : element.buildScope();
+        ? element.enclosingElement.buildScope()
+        : element.buildScope();
   }
 }
 
@@ -64,8 +68,7 @@ class VariableDefinitionScope extends NestedScope {
 class TypeDeclarationScope extends NestedScope {
   final TypeDeclarationElement element;
 
-  TypeDeclarationScope(parent, this.element)
-      : super(parent) {
+  TypeDeclarationScope(parent, this.element) : super(parent) {
     assert(parent != null);
   }
 
@@ -85,8 +88,7 @@ class TypeDeclarationScope extends NestedScope {
 
   Element localLookup(String name) => lookupTypeVariable(name);
 
-  String toString() =>
-      'TypeDeclarationScope($element)';
+  String toString() => 'TypeDeclarationScope($element)';
 }
 
 abstract class MutableScope extends NestedScope {
@@ -112,8 +114,7 @@ abstract class MutableScope extends NestedScope {
 class MethodScope extends MutableScope {
   final Element element;
 
-  MethodScope(Scope parent, this.element)
-      : super(parent);
+  MethodScope(Scope parent, this.element) : super(parent);
 
   String toString() => 'MethodScope($element${elements.keys.toList()})';
 }
@@ -133,7 +134,7 @@ class ClassScope extends TypeDeclarationScope {
   ClassElement get element => super.element;
 
   ClassScope(Scope parentScope, ClassElement element)
-      : super(parentScope, element)  {
+      : super(parentScope, element) {
     assert(parent != null);
   }
 

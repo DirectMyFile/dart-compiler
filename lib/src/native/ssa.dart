@@ -2,25 +2,37 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of native;
+import '../common.dart';
+import '../compiler.dart' show Compiler;
+import '../constants/values.dart';
+import '../dart_types.dart';
+import '../elements/elements.dart';
+import '../js/js.dart' as js;
+import '../js_backend/js_backend.dart';
+import '../js_emitter/js_emitter.dart' show NativeEmitter;
+import '../ssa/builder.dart' show SsaBuilder;
+import '../ssa/nodes.dart' show HInstruction, HForeignCode, HReturn;
+import '../tree/tree.dart';
+import '../universe/side_effects.dart' show SideEffects;
 
 final RegExp nativeRedirectionRegExp = new RegExp(r'^[a-zA-Z][a-zA-Z_$0-9]*$');
 
 void handleSsaNative(SsaBuilder builder, Expression nativeBody) {
   Compiler compiler = builder.compiler;
-  FunctionElement element = builder.work.element;
+  FunctionElement element = builder.target;
   NativeEmitter nativeEmitter = builder.nativeEmitter;
   JavaScriptBackend backend = builder.backend;
+  DiagnosticReporter reporter = compiler.reporter;
 
-  HInstruction convertDartClosure(ParameterElement  parameter,
-                                  FunctionType type) {
+  HInstruction convertDartClosure(
+      ParameterElement parameter, FunctionType type) {
     HInstruction local = builder.localsHandler.readLocal(parameter);
     ConstantValue arityConstant =
         builder.constantSystem.createInt(type.computeArity());
     HInstruction arity = builder.graph.addConstant(arityConstant, compiler);
     // TODO(ngeoffray): For static methods, we could pass a method with a
     // defined arity.
-    Element helper = backend.getClosureConverter();
+    Element helper = backend.helpers.closureConverter;
     builder.pushInvokeStatic(nativeBody, helper, [local, arity]);
     HInstruction closure = builder.pop();
     return closure;
@@ -34,13 +46,13 @@ void handleSsaNative(SsaBuilder builder, Expression nativeBody) {
   // 3) foo() native "return 42";
   //      hasBody = true
   bool hasBody = false;
-  assert(element.isNative);
-  String nativeMethodName = element.fixedBackendName;
+  assert(backend.isNative(element));
+  String nativeMethodName = backend.nativeData.getFixedBackendName(element);
   if (nativeBody != null) {
     LiteralString jsCode = nativeBody.asLiteralString();
     String str = jsCode.dartString.slowToString();
     if (nativeRedirectionRegExp.hasMatch(str)) {
-      compiler.internalError(
+      reporter.internalError(
           nativeBody, "Deprecated syntax, use @JSName('name') instead.");
     }
     hasBody = true;
@@ -60,7 +72,7 @@ void handleSsaNative(SsaBuilder builder, Expression nativeBody) {
       inputs.add(builder.localsHandler.readThis());
     }
     parameters.forEachParameter((ParameterElement parameter) {
-      DartType type = parameter.type.unalias(compiler);
+      DartType type = parameter.type.unaliased;
       HInstruction input = builder.localsHandler.readLocal(parameter);
       if (type is FunctionType) {
         // The parameter type is a function type either directly or through
@@ -80,27 +92,31 @@ void handleSsaNative(SsaBuilder builder, Expression nativeBody) {
     } else if (element.kind == ElementKind.SETTER) {
       nativeMethodCall = '$receiver$nativeMethodName = $foreignParameters';
     } else {
-      builder.compiler.internalError(element,
-                                     'Unexpected kind: "${element.kind}".');
+      builder.reporter
+          .internalError(element, 'Unexpected kind: "${element.kind}".');
     }
 
-    builder.push(
-        new HForeign(
-            // TODO(sra): This could be cached.  The number of templates should
-            // be proportional to the number of native methods, which is bounded
-            // by the dart: libraries.
-            js.js.uncachedExpressionTemplate(nativeMethodCall),
-            backend.dynamicType,
-            inputs, effects: new SideEffects()));
-    builder.close(new HReturn(builder.pop())).addSuccessor(builder.graph.exit);
+    builder.push(new HForeignCode(
+        // TODO(sra): This could be cached.  The number of templates should
+        // be proportional to the number of native methods, which is bounded
+        // by the dart: libraries.
+        js.js.uncachedExpressionTemplate(nativeMethodCall),
+        backend.dynamicType,
+        inputs,
+        effects: new SideEffects()));
+    // TODO(johnniwinther): Provide source information.
+    builder
+        .close(new HReturn(builder.pop(), null))
+        .addSuccessor(builder.graph.exit);
   } else {
     if (parameters.parameterCount != 0) {
-      compiler.internalError(nativeBody,
+      reporter.internalError(
+          nativeBody,
           'native "..." syntax is restricted to '
           'functions with zero parameters.');
     }
     LiteralString jsCode = nativeBody.asLiteralString();
-    builder.push(new HForeign.statement(
+    builder.push(new HForeignCode.statement(
         js.js.statementTemplateYielding(
             new js.LiteralStatement(jsCode.dartString.slowToString())),
         <HInstruction>[],

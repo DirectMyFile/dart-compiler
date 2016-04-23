@@ -2,10 +2,36 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of scanner;
+library dart2js.scanner.task;
+
+import '../common/tasks.dart' show CompilerTask;
+import '../compiler.dart' show Compiler;
+import '../elements/elements.dart' show CompilationUnitElement, LibraryElement;
+import '../script.dart' show Script;
+import '../parser/diet_parser_task.dart' show DietParserTask;
+import '../tokens/token.dart' show Token;
+import '../tokens/token_constants.dart' as Tokens show COMMENT_TOKEN, EOF_TOKEN;
+import '../tokens/token_map.dart' show TokenMap;
+
+import 'scanner.dart' show Scanner;
+import 'string_scanner.dart' show StringScanner;
 
 class ScannerTask extends CompilerTask {
-  ScannerTask(Compiler compiler) : super(compiler);
+  final DietParserTask _dietParser;
+  final bool _preserveComments;
+  final TokenMap _commentMap;
+
+  ScannerTask(Compiler compiler, this._dietParser,
+      {bool preserveComments: false, TokenMap commentMap})
+      : _preserveComments = preserveComments,
+        _commentMap = commentMap,
+        super(compiler) {
+    if (_preserveComments && _commentMap == null) {
+      throw new ArgumentError(
+          "commentMap must be provided if preserveComments is true");
+    }
+  }
+
   String get name => 'Scanner';
 
   void scanLibrary(LibraryElement library) {
@@ -13,9 +39,9 @@ class ScannerTask extends CompilerTask {
     String canonicalUri = library.canonicalUri.toString();
     String resolvedUri = compilationUnit.script.resourceUri.toString();
     if (canonicalUri == resolvedUri) {
-      compiler.log("Scanning library $canonicalUri");
+      reporter.log("Scanning library $canonicalUri");
     } else {
-      compiler.log("Scanning library $canonicalUri ($resolvedUri)");
+      reporter.log("Scanning library $canonicalUri ($resolvedUri)");
     }
     scan(compilationUnit);
   }
@@ -28,12 +54,12 @@ class ScannerTask extends CompilerTask {
 
   void scanElements(CompilationUnitElement compilationUnit) {
     Script script = compilationUnit.script;
-    Token tokens = new Scanner(script.file,
-        includeComments: compiler.preserveComments).tokenize();
-    if (compiler.preserveComments) {
-      tokens = compiler.processAndStripComments(tokens);
+    Token tokens =
+        new Scanner(script.file, includeComments: _preserveComments).tokenize();
+    if (_preserveComments) {
+      tokens = processAndStripComments(tokens);
     }
-    compiler.dietParser.dietParse(compilationUnit, tokens);
+    _dietParser.dietParse(compilationUnit, tokens);
   }
 
   /**
@@ -49,23 +75,26 @@ class ScannerTask extends CompilerTask {
           .tokenize();
     });
   }
-}
 
-class DietParserTask extends CompilerTask {
-  DietParserTask(Compiler compiler) : super(compiler);
-  final String name = 'Diet Parser';
-
-  dietParse(CompilationUnitElement compilationUnit, Token tokens) {
-    measure(() {
-      Function idGenerator = compiler.getNextFreeClassId;
-      ElementListener listener =
-          new ElementListener(compiler, compilationUnit, idGenerator);
-      PartialParser parser = new PartialParser(listener);
-      try {
-        parser.parseUnit(tokens);
-      } on ParserError catch (e) {
-        assert(invariant(compilationUnit, compiler.compilationFailed));
+  Token processAndStripComments(Token currentToken) {
+    Token firstToken = currentToken;
+    Token prevToken;
+    while (currentToken.kind != Tokens.EOF_TOKEN) {
+      if (identical(currentToken.kind, Tokens.COMMENT_TOKEN)) {
+        Token firstCommentToken = currentToken;
+        while (identical(currentToken.kind, Tokens.COMMENT_TOKEN)) {
+          currentToken = currentToken.next;
+        }
+        _commentMap[currentToken] = firstCommentToken;
+        if (prevToken == null) {
+          firstToken = currentToken;
+        } else {
+          prevToken.next = currentToken;
+        }
       }
-    });
+      prevToken = currentToken;
+      currentToken = currentToken.next;
+    }
+    return firstToken;
   }
 }

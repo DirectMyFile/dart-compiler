@@ -4,18 +4,7 @@
 
 library tree;
 
-import 'dart:collection';
-
-import '../scanner/scannerlib.dart';
-import '../util/util.dart';
-import '../util/characters.dart';
-
-import '../resolution/secret_tree_element.dart'
-    show StoredTreeElementMixin, NullTreeElementMixin;
-
-import '../elements/elements.dart' show MetadataAnnotation;
-
-part 'dartstring.dart';
-part 'nodes.dart';
-part 'prettyprint.dart';
-part 'unparser.dart';
+export 'dartstring.dart';
+export 'nodes.dart';
+export 'prettyprint.dart';
+export 'unparser.dart';

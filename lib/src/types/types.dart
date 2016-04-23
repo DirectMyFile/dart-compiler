@@ -4,13 +4,24 @@
 
 library types;
 
-import '../dart2jslib.dart' hide Selector, TypedSelector;
+import '../common.dart';
+import '../common/backend_api.dart' show Backend;
+import '../common/tasks.dart' show CompilerTask;
+import '../compiler.dart' show Compiler;
+import '../constants/values.dart' show PrimitiveConstantValue;
 import '../elements/elements.dart';
 import '../inferrer/type_graph_inferrer.dart' show TypeGraphInferrer;
 import '../tree/tree.dart';
 import '../util/util.dart';
-import '../universe/universe.dart';
-import '../inferrer/concrete_types_inferrer.dart' show ConcreteTypesInferrer;
+import '../universe/selector.dart' show Selector;
+import '../universe/universe.dart'
+    show
+        ReceiverConstraint,
+        UniverseSelectorConstraints,
+        SelectorConstraintsStrategy;
+import '../world.dart' show ClassWorld, World;
+
+import 'abstract_value_domain.dart' show AbstractValue;
 
 part 'container_type_mask.dart';
 part 'dictionary_type_mask.dart';
@@ -29,7 +40,7 @@ abstract class TypesInferrer {
   TypeMask getReturnTypeOfElement(Element element);
   TypeMask getTypeOfElement(Element element);
   TypeMask getTypeOfNode(Element owner, Node node);
-  TypeMask getTypeOfSelector(Selector selector);
+  TypeMask getTypeOfSelector(Selector selector, TypeMask mask);
   void clear();
   bool isCalledOnce(Element element);
   bool isFixedArrayCheckedForGrowable(Node node);
@@ -39,21 +50,14 @@ abstract class TypesInferrer {
  * The types task infers guaranteed types globally.
  */
 class TypesTask extends CompilerTask {
-  static final bool DUMP_BAD_CPA_RESULTS = false;
-  static final bool DUMP_GOOD_CPA_RESULTS = false;
-
   final String name = 'Type inference';
   final ClassWorld classWorld;
   TypesInferrer typesInferrer;
-  ConcreteTypesInferrer concreteTypesInferrer;
 
   TypesTask(Compiler compiler)
       : this.classWorld = compiler.world,
         super(compiler) {
     typesInferrer = new TypeGraphInferrer(compiler);
-    if (compiler.enableConcreteTypeInference) {
-      concreteTypesInferrer = new ConcreteTypesInferrer(compiler);
-    }
   }
 
   TypeMask dynamicTypeCache;
@@ -75,6 +79,9 @@ class TypesTask extends CompilerTask {
   TypeMask constMapTypeCache;
   TypeMask stringTypeCache;
   TypeMask typeTypeCache;
+  TypeMask syncStarIterableTypeCache;
+  TypeMask asyncFutureTypeCache;
+  TypeMask asyncStarStreamTypeCache;
 
   TypeMask get dynamicType {
     if (dynamicTypeCache == null) {
@@ -220,6 +227,30 @@ class TypesTask extends CompilerTask {
     return typeTypeCache;
   }
 
+  TypeMask get syncStarIterableType {
+    if (syncStarIterableTypeCache == null) {
+      syncStarIterableTypeCache = new TypeMask.nonNullExact(
+          compiler.backend.syncStarIterableImplementation, compiler.world);
+    }
+    return syncStarIterableTypeCache;
+  }
+
+  TypeMask get asyncFutureType {
+    if (asyncFutureTypeCache == null) {
+      asyncFutureTypeCache = new TypeMask.nonNullExact(
+          compiler.backend.asyncFutureImplementation, compiler.world);
+    }
+    return asyncFutureTypeCache;
+  }
+
+  TypeMask get asyncStarStreamType {
+    if (asyncStarStreamTypeCache == null) {
+      asyncStarStreamTypeCache = new TypeMask.nonNullExact(
+          compiler.backend.asyncStarStreamImplementation, compiler.world);
+    }
+    return asyncStarStreamTypeCache;
+  }
+
   TypeMask get nullType {
     if (nullTypeCache == null) {
       // TODO(johnniwinther): Assert that the null type has been resolved.
@@ -238,25 +269,18 @@ class TypesTask extends CompilerTask {
   /** Computes the intersection of [type1] and [type2] */
   TypeMask intersection(TypeMask type1, TypeMask type2, element) {
     TypeMask result = _intersection(type1, type2);
-    if (DUMP_BAD_CPA_RESULTS && better(type1, type2)) {
-      print("CPA is worse for $element: $type1 /\\ $type2 = $result");
-    }
-    if (DUMP_GOOD_CPA_RESULTS && better(type2, type1)) {
-      print("CPA is better for $element: $type1 /\\ $type2 = $result");
-    }
     return result;
   }
 
-  /** Returns true if [type1] is strictly bettern than [type2]. */
+  /** Returns true if [type1] is strictly better than [type2]. */
   bool better(TypeMask type1, TypeMask type2) {
     if (type1 == null) return false;
     if (type2 == null) {
-      return (type1 != null) &&
-             (type1 != dynamicType);
+      return (type1 != null) && (type1 != dynamicType);
     }
     return (type1 != type2) &&
-           type2.containsMask(type1, classWorld) &&
-           !type1.containsMask(type2, classWorld);
+        type2.containsMask(type1, classWorld) &&
+        !type1.containsMask(type2, classWorld);
   }
 
   /**
@@ -265,43 +289,30 @@ class TypesTask extends CompilerTask {
   void onResolutionComplete(Element mainElement) {
     measure(() {
       typesInferrer.analyzeMain(mainElement);
-      if (concreteTypesInferrer != null) {
-        bool success = concreteTypesInferrer.analyzeMain(mainElement);
-        if (!success) {
-          // If the concrete type inference bailed out, we pretend it didn't
-          // happen. In the future we might want to record that it failed but
-          // use the partial results as hints.
-          concreteTypesInferrer = null;
-        }
-      }
+      typesInferrer.clear();
     });
-    typesInferrer.clear();
   }
 
   /**
    * Return the (inferred) guaranteed type of [element] or null.
    */
   TypeMask getGuaranteedTypeOfElement(Element element) {
-    return measure(() {
-      TypeMask guaranteedType = typesInferrer.getTypeOfElement(element);
-      return (concreteTypesInferrer == null)
-          ? guaranteedType
-          : intersection(guaranteedType,
-                         concreteTypesInferrer.getTypeOfElement(element),
-                         element);
-    });
+    // TODO(24489): trust some JsInterop types.
+    if (compiler.backend.isJsInterop(element)) {
+      return dynamicType;
+    }
+    TypeMask guaranteedType = typesInferrer.getTypeOfElement(element);
+    return guaranteedType;
   }
 
   TypeMask getGuaranteedReturnTypeOfElement(Element element) {
-    return measure(() {
-      TypeMask guaranteedType =
-          typesInferrer.getReturnTypeOfElement(element);
-      return (concreteTypesInferrer == null)
-          ? guaranteedType
-          : intersection(guaranteedType,
-                         concreteTypesInferrer.getReturnTypeOfElement(element),
-                         element);
-    });
+    // TODO(24489): trust some JsInterop types.
+    if (compiler.backend.isJsInterop(element)) {
+      return dynamicType;
+    }
+
+    TypeMask guaranteedType = typesInferrer.getReturnTypeOfElement(element);
+    return guaranteedType;
   }
 
   /**
@@ -309,28 +320,15 @@ class TypesTask extends CompilerTask {
    * [node] must be an AST node of [owner].
    */
   TypeMask getGuaranteedTypeOfNode(owner, node) {
-    return measure(() {
-      TypeMask guaranteedType = typesInferrer.getTypeOfNode(owner, node);
-      return (concreteTypesInferrer == null)
-          ? guaranteedType
-          : intersection(guaranteedType,
-                         concreteTypesInferrer.getTypeOfNode(owner, node),
-                         node);
-    });
+    TypeMask guaranteedType = typesInferrer.getTypeOfNode(owner, node);
+    return guaranteedType;
   }
 
   /**
    * Return the (inferred) guaranteed type of [selector] or null.
    */
-  TypeMask getGuaranteedTypeOfSelector(Selector selector) {
-    return measure(() {
-      TypeMask guaranteedType =
-          typesInferrer.getTypeOfSelector(selector);
-      return (concreteTypesInferrer == null)
-          ? guaranteedType
-          : intersection(guaranteedType,
-                         concreteTypesInferrer.getTypeOfSelector(selector),
-                         selector);
-    });
+  TypeMask getGuaranteedTypeOfSelector(Selector selector, TypeMask mask) {
+    TypeMask guaranteedType = typesInferrer.getTypeOfSelector(selector, mask);
+    return guaranteedType;
   }
 }

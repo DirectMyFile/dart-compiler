@@ -2,14 +2,26 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of scanner;
+library dart2js.scanner.utf8;
+
+import 'dart:convert' show UNICODE_BOM_CHARACTER_RUNE, UTF8;
+
+import '../io/source_file.dart' show SourceFile;
+import '../tokens/precedence.dart' show PrecedenceInfo;
+import '../tokens/token.dart' show StringToken, Token;
+
+import 'array_based_scanner.dart' show ArrayBasedScanner;
 
 /**
  * Scanner that reads from a UTF-8 encoded list of bytes and creates tokens
  * that points to substrings.
  */
 class Utf8BytesScanner extends ArrayBasedScanner {
-  /** The file content. */
+  /**
+   * The file content.
+   *
+   * The content is zero-terminated.
+   */
   List<int> bytes;
 
   /**
@@ -66,9 +78,9 @@ class Utf8BytesScanner extends ArrayBasedScanner {
    * is not the case, the entire array is copied before scanning.
    */
   Utf8BytesScanner(SourceFile file, {bool includeComments: false})
-      : bytes = file.slowUtf8Bytes(),
+      : bytes = file.slowUtf8ZeroTerminatedBytes(),
         super(file, includeComments) {
-    ensureZeroTermination();
+    assert(bytes.last == 0);
     // Skip a leading BOM.
     if (_containsBomAt(0)) byteOffset += 3;
   }
@@ -80,21 +92,11 @@ class Utf8BytesScanner extends ArrayBasedScanner {
    * the file. If this is not the case, the entire array is copied before
    * scanning.
    */
-  Utf8BytesScanner.fromBytes(this.bytes, {bool includeComments: false})
-      : super(null, includeComments) {
-    ensureZeroTermination();
-  }
-
-  void ensureZeroTermination() {
-    if (bytes.isEmpty || bytes[bytes.length - 1] != 0) {
-      // TODO(lry): abort instead of copying the array, or warn?
-      var newBytes =  new Uint8List(bytes.length + 1);
-      for (int i = 0; i < bytes.length; i++) {
-        newBytes[i] = bytes[i];
-      }
-      newBytes[bytes.length] = 0;
-      bytes = newBytes;
-    }
+  Utf8BytesScanner.fromBytes(List<int> zeroTerminatedBytes,
+      {bool includeComments: false})
+      : this.bytes = zeroTerminatedBytes,
+        super(null, includeComments) {
+    assert(bytes.last == 0);
   }
 
   bool _containsBomAt(int offset) {
@@ -203,7 +205,7 @@ class Utf8BytesScanner extends ArrayBasedScanner {
   Token previousToken() => tail;
 
   void appendSubstringToken(PrecedenceInfo info, int start, bool asciiOnly,
-                            [int extraOffset = 0]) {
+      [int extraOffset = 0]) {
     tail.next = new StringToken.fromUtf8Bytes(
         info, bytes, start, byteOffset + extraOffset, asciiOnly, tokenStart);
     tail = tail.next;

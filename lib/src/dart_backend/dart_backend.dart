@@ -6,33 +6,33 @@ library dart_backend;
 
 import 'dart:async' show Future;
 import 'dart:math' show max;
-import '../elements/elements.dart';
-import '../dart2jslib.dart';
-import '../library_loader.dart' show LoadedLibraries;
-import '../dart_types.dart';
-import '../tree/tree.dart';
-import '../cps_ir/cps_ir_nodes.dart' as cps_ir;
-import '../constants/expressions.dart';
-import '../cps_ir/optimizers.dart';
-import '../tree_ir/tree_ir_builder.dart' as tree_builder;
-import '../tree_ir/tree_ir_nodes.dart' as tree_ir;
-import '../util/util.dart';
-import '../mirror_renamer/mirror_renamer.dart';
-import '../tree_ir/optimization/optimization.dart'
-    show LogicalRewriter, LoopRewriter, CopyPropagator, StatementRewriter;
-import 'backend_ast_emitter.dart' as backend_ast_emitter;
-import 'backend_ast_nodes.dart' as backend_ast;
-import 'backend_ast_to_frontend_ast.dart' as backend2frontend;
-import '../tracer.dart';
-import '../../compiler.dart' show CompilerOutputProvider;
 
-import '../scanner/scannerlib.dart' show StringToken,
-                                         Keyword,
-                                         OPEN_PAREN_INFO,
-                                         CLOSE_PAREN_INFO,
-                                         SEMICOLON_INFO,
-                                         IDENTIFIER_INFO;
-import '../js_backend/codegen/glue.dart';
+import '../../compiler.dart' show CompilerOutputProvider;
+import '../common.dart';
+import '../common/backend_api.dart' show Backend, ImpactTransformer;
+import '../common/codegen.dart' show CodegenWorkItem;
+import '../common/names.dart' show Selectors, Uris;
+import '../common/registry.dart' show Registry;
+import '../common/resolution.dart' show Resolution, ResolutionImpact;
+import '../common/tasks.dart' show CompilerTask;
+import '../compiler.dart' show Compiler;
+import '../compile_time_constants.dart';
+import '../constants/constant_system.dart';
+import '../constants/expressions.dart';
+import '../constants/values.dart';
+import '../dart_types.dart';
+import '../elements/elements.dart';
+import '../enqueue.dart' show Enqueuer, ResolutionEnqueuer;
+import '../library_loader.dart' show LoadedLibraries;
+import '../mirror_renamer/mirror_renamer.dart';
+import '../resolution/tree_elements.dart' show TreeElements, TreeElementMapping;
+import '../tokens/keyword.dart' show Keyword;
+import '../tree/tree.dart';
+import '../universe/selector.dart' show Selector;
+import '../universe/use.dart' show DynamicUse, TypeUse, TypeUseKind;
+import '../universe/world_impact.dart' show WorldImpact, TransformedWorldImpact;
+import '../util/util.dart';
+import 'backend_ast_to_frontend_ast.dart' as backend2frontend;
 
 part 'backend.dart';
 part 'renamer.dart';

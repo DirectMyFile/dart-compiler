@@ -6,34 +6,23 @@ library dart_types;
 
 import 'dart:math' show min;
 
+import 'common/resolution.dart' show Resolution;
+import 'common.dart';
 import 'core_types.dart';
-import 'dart2jslib.dart' show Compiler, invariant, Script, Message;
-import 'elements/modelx.dart'
-    show VoidElementX,
-         LibraryElementX,
-         BaseClassElementX,
-         TypeDeclarationElementX,
-         TypedefElementX;
 import 'elements/elements.dart';
-import 'helpers/helpers.dart';  // Included for debug helpers.
+import 'elements/modelx.dart' show TypeDeclarationElementX;
 import 'ordered_typeset.dart' show OrderedTypeSet;
-import 'util/util.dart' show CURRENT_ELEMENT_SPANNABLE, equalElements;
+import 'util/util.dart' show equalElements;
 
-class TypeKind {
-  final String id;
-
-  const TypeKind(String this.id);
-
-  static const TypeKind FUNCTION = const TypeKind('function');
-  static const TypeKind INTERFACE = const TypeKind('interface');
-  static const TypeKind STATEMENT = const TypeKind('statement');
-  static const TypeKind TYPEDEF = const TypeKind('typedef');
-  static const TypeKind TYPE_VARIABLE = const TypeKind('type variable');
-  static const TypeKind MALFORMED_TYPE = const TypeKind('malformed');
-  static const TypeKind DYNAMIC = const TypeKind('dynamic');
-  static const TypeKind VOID = const TypeKind('void');
-
-  String toString() => id;
+enum TypeKind {
+  FUNCTION,
+  INTERFACE,
+  STATEMENT,
+  TYPEDEF,
+  TYPE_VARIABLE,
+  MALFORMED_TYPE,
+  DYNAMIC,
+  VOID,
 }
 
 abstract class DartType {
@@ -73,17 +62,26 @@ abstract class DartType {
     return subst(type.typeArguments, type.element.typeVariables);
   }
 
-  /**
-   * Returns the unaliased type of this type.
-   *
-   * The unaliased type of a typedef'd type is the unaliased type to which its
-   * name is bound. The unaliased version of any other type is the type itself.
-   *
-   * For example, the unaliased type of [: typedef A Func<A,B>(B b) :] is the
-   * function type [: (B) -> A :] and the unaliased type of
-   * [: Func<int,String> :] is the function type [: (String) -> int :].
-   */
-  DartType unalias(Compiler compiler);
+  /// Computes the unaliased type of this type.
+  ///
+  /// The unaliased type of a typedef'd type is the unaliased type to which its
+  /// name is bound. The unaliased version of any other type is the type itself.
+  ///
+  /// For example, the unaliased type of `typedef A Func<A,B>(B b)` is the
+  /// function type `(B) -> A` and the unaliased type of `Func<int,String>`
+  /// is the function type `(String) -> int`.
+  // TODO(johnniwinther): Maybe move this to [TypedefType].
+  void computeUnaliased(Resolution resolution) {}
+
+  /// Returns the unaliased type of this type.
+  ///
+  /// The unaliased type of a typedef'd type is the unaliased type to which its
+  /// name is bound. The unaliased version of any other type is the type itself.
+  ///
+  /// For example, the unaliased type of `typedef A Func<A,B>(B b)` is the
+  /// function type `(B) -> A` and the unaliased type of `Func<int,String>`
+  /// is the function type `(String) -> int`.
+  DartType get unaliased => this;
 
   /**
    * If this type is malformed or a generic type created with the wrong number
@@ -160,8 +158,8 @@ abstract class DartType {
 
   void visitChildren(DartTypeVisitor visitor, var argument) {}
 
-  static void visitList(List<DartType> types,
-                        DartTypeVisitor visitor, var argument) {
+  static void visitList(
+      List<DartType> types, DartTypeVisitor visitor, var argument) {
     for (DartType type in types) {
       type.accept(visitor, argument);
     }
@@ -216,9 +214,7 @@ class TypeVariableType extends DartType {
     return this;
   }
 
-  DartType unalias(Compiler compiler) => this;
-
-  DartType get typeVariableOccurrence => this;
+  TypeVariableType get typeVariableOccurrence => this;
 
   void forEachTypeVariable(f(TypeVariableType variable)) {
     f(this);
@@ -231,7 +227,7 @@ class TypeVariableType extends DartType {
   int get hashCode => 17 * element.hashCode;
 
   bool operator ==(other) {
-    if (other is !TypeVariableType) return false;
+    if (other is! TypeVariableType) return false;
     return identical(other.element, element);
   }
 
@@ -249,8 +245,6 @@ class StatementType extends DartType {
   const StatementType();
 
   DartType subst(List<DartType> arguments, List<DartType> parameters) => this;
-
-  DartType unalias(Compiler compiler) => this;
 
   accept(DartTypeVisitor visitor, var argument) {
     return visitor.visitStatementType(this, argument);
@@ -270,8 +264,6 @@ class VoidType extends DartType {
     // Void cannot be substituted.
     return this;
   }
-
-  DartType unalias(Compiler compiler) => this;
 
   accept(DartTypeVisitor visitor, var argument) {
     return visitor.visitVoidType(this, argument);
@@ -307,7 +299,7 @@ class MalformedType extends DartType {
   static int nextHash = 43765;
 
   MalformedType(this.element, this.userProvidedBadType,
-                [this.typeArguments = null]);
+      [this.typeArguments = null]);
 
   TypeKind get kind => TypeKind.MALFORMED_TYPE;
 
@@ -320,8 +312,6 @@ class MalformedType extends DartType {
 
   // Malformed types are treated as dynamic.
   bool get treatAsDynamic => true;
-
-  DartType unalias(Compiler compiler) => this;
 
   accept(DartTypeVisitor visitor, var argument) {
     return visitor.visitMalformedType(this, argument);
@@ -351,19 +341,21 @@ abstract class GenericType extends DartType {
   final TypeDeclarationElement element;
   final List<DartType> typeArguments;
 
-  GenericType(TypeDeclarationElement element,
-              this.typeArguments,
-              {bool checkTypeArgumentCount: true})
+  GenericType(TypeDeclarationElement element, this.typeArguments,
+      {bool checkTypeArgumentCount: true})
       : this.element = element {
+    assert(invariant(CURRENT_ELEMENT_SPANNABLE, element != null,
+        message: "Missing element for generic type."));
     assert(invariant(element, () {
-        if (!checkTypeArgumentCount) return true;
-        if (element is TypeDeclarationElementX) {
-          return element.thisTypeCache == null ||
-                 typeArguments.length == element.typeVariables.length;
-        }
-        return true;
-    }, message: () => 'Invalid type argument count on ${element.thisType}. '
-                      'Provided type arguments: $typeArguments.'));
+      if (!checkTypeArgumentCount) return true;
+      if (element is TypeDeclarationElementX) {
+        return element.thisTypeCache == null ||
+            typeArguments.length == element.typeVariables.length;
+      }
+      return true;
+    },
+        message: () => 'Invalid type argument count on ${element.thisType}. '
+            'Provided type arguments: $typeArguments.'));
   }
 
   /// Creates a new instance of this type using the provided type arguments.
@@ -423,10 +415,10 @@ abstract class GenericType extends DartType {
   }
 
   bool operator ==(other) {
-    if (other is !GenericType) return false;
-    return kind == other.kind
-        && element == other.element
-        && equalElements(typeArguments, other.typeArguments);
+    if (other is! GenericType) return false;
+    return kind == other.kind &&
+        element == other.element &&
+        equalElements(typeArguments, other.typeArguments);
   }
 
   /// Returns `true` if the declaration of this type has type variables.
@@ -446,15 +438,16 @@ abstract class GenericType extends DartType {
 }
 
 class InterfaceType extends GenericType {
+  int _hashCode;
+
   InterfaceType(ClassElement element,
-                [List<DartType> typeArguments = const <DartType>[]])
+      [List<DartType> typeArguments = const <DartType>[]])
       : super(element, typeArguments) {
     assert(invariant(element, element.isDeclaration));
   }
 
-  InterfaceType.forUserProvidedBadType(BaseClassElementX element,
-                                       [List<DartType> typeArguments =
-                                           const <DartType>[]])
+  InterfaceType.forUserProvidedBadType(ClassElement element,
+      [List<DartType> typeArguments = const <DartType>[]])
       : super(element, typeArguments, checkTypeArgumentCount: false);
 
   ClassElement get element => super.element;
@@ -475,20 +468,17 @@ class InterfaceType extends GenericType {
    * Returns the type as an instance of class [other], if possible, null
    * otherwise.
    */
-  DartType asInstanceOf(ClassElement other) {
+  InterfaceType asInstanceOf(ClassElement other) {
     other = other.declaration;
     if (element == other) return this;
     InterfaceType supertype = element.asInstanceOf(other);
     if (supertype != null) {
-      List<DartType> arguments = Types.substTypes(supertype.typeArguments,
-                                                  typeArguments,
-                                                  element.typeVariables);
+      List<DartType> arguments = Types.substTypes(
+          supertype.typeArguments, typeArguments, element.typeVariables);
       return new InterfaceType(supertype.element, arguments);
     }
     return null;
   }
-
-  DartType unalias(Compiler compiler) => this;
 
   MemberSignature lookupInterfaceMember(Name name) {
     MemberSignature member = element.lookupInterfaceMember(name);
@@ -506,7 +496,7 @@ class InterfaceType extends GenericType {
     return member;
   }
 
-  int get hashCode => super.hashCode;
+  int get hashCode => _hashCode ??= super.hashCode;
 
   InterfaceType asRaw() => super.asRaw();
 
@@ -531,15 +521,13 @@ class InterfaceType extends GenericType {
 class BadInterfaceType extends InterfaceType {
   final InterfaceType userProvidedBadType;
 
-  BadInterfaceType(ClassElement element,
-                   InterfaceType this.userProvidedBadType)
+  BadInterfaceType(ClassElement element, InterfaceType this.userProvidedBadType)
       : super(element, element.rawType.typeArguments);
 
   String toString() {
     return userProvidedBadType.toString();
   }
 }
-
 
 /**
  * Special subclass of [TypedefType] used for generic typedef types created
@@ -550,8 +538,7 @@ class BadInterfaceType extends InterfaceType {
 class BadTypedefType extends TypedefType {
   final TypedefType userProvidedBadType;
 
-  BadTypedefType(TypedefElement element,
-                 TypedefType this.userProvidedBadType)
+  BadTypedefType(TypedefElement element, TypedefType this.userProvidedBadType)
       : super(element, element.rawType.typeArguments);
 
   String toString() {
@@ -576,45 +563,40 @@ class FunctionType extends DartType {
    */
   final List<DartType> namedParameterTypes;
 
-  factory FunctionType(
-      FunctionTypedElement element,
+  factory FunctionType(FunctionTypedElement element,
       [DartType returnType = const DynamicType(),
-       List<DartType> parameterTypes = const <DartType>[],
-       List<DartType> optionalParameterTypes = const <DartType>[],
-       List<String> namedParameters = const <String>[],
-       List<DartType> namedParameterTypes = const <DartType>[]]) {
+      List<DartType> parameterTypes = const <DartType>[],
+      List<DartType> optionalParameterTypes = const <DartType>[],
+      List<String> namedParameters = const <String>[],
+      List<DartType> namedParameterTypes = const <DartType>[]]) {
     assert(invariant(CURRENT_ELEMENT_SPANNABLE, element != null));
     assert(invariant(element, element.isDeclaration));
-    return new FunctionType.internal(element,
-        returnType, parameterTypes, optionalParameterTypes,
-        namedParameters, namedParameterTypes);
+    return new FunctionType.internal(element, returnType, parameterTypes,
+        optionalParameterTypes, namedParameters, namedParameterTypes);
   }
 
   factory FunctionType.synthesized(
       [DartType returnType = const DynamicType(),
-       List<DartType> parameterTypes = const <DartType>[],
-       List<DartType> optionalParameterTypes = const <DartType>[],
-       List<String> namedParameters = const <String>[],
-       List<DartType> namedParameterTypes = const <DartType>[]]) {
-    return new FunctionType.internal(null,
-        returnType, parameterTypes, optionalParameterTypes,
-        namedParameters, namedParameterTypes);
+      List<DartType> parameterTypes = const <DartType>[],
+      List<DartType> optionalParameterTypes = const <DartType>[],
+      List<String> namedParameters = const <String>[],
+      List<DartType> namedParameterTypes = const <DartType>[]]) {
+    return new FunctionType.internal(null, returnType, parameterTypes,
+        optionalParameterTypes, namedParameters, namedParameterTypes);
   }
 
   FunctionType.internal(FunctionTypedElement this.element,
-                        [DartType this.returnType = const DynamicType(),
-                         this.parameterTypes = const <DartType>[],
-                         this.optionalParameterTypes = const <DartType>[],
-                         this.namedParameters = const <String>[],
-                         this.namedParameterTypes = const <DartType>[]]) {
-    assert(invariant(CURRENT_ELEMENT_SPANNABLE,
-        element == null || element.isDeclaration));
+      [DartType this.returnType = const DynamicType(),
+      this.parameterTypes = const <DartType>[],
+      this.optionalParameterTypes = const <DartType>[],
+      this.namedParameters = const <String>[],
+      this.namedParameterTypes = const <DartType>[]]) {
+    assert(invariant(
+        CURRENT_ELEMENT_SPANNABLE, element == null || element.isDeclaration));
     // Assert that optional and named parameters are not used at the same time.
     assert(optionalParameterTypes.isEmpty || namedParameterTypes.isEmpty);
     assert(namedParameters.length == namedParameterTypes.length);
   }
-
-
 
   TypeKind get kind => TypeKind.FUNCTION;
 
@@ -643,25 +625,24 @@ class FunctionType extends DartType {
         Types.substTypes(namedParameterTypes, arguments, parameters);
     if (!changed &&
         (!identical(parameterTypes, newParameterTypes) ||
-         !identical(optionalParameterTypes, newOptionalParameterTypes) ||
-         !identical(namedParameterTypes, newNamedParameterTypes))) {
+            !identical(optionalParameterTypes, newOptionalParameterTypes) ||
+            !identical(namedParameterTypes, newNamedParameterTypes))) {
       changed = true;
     }
     if (changed) {
       // Create a new type only if necessary.
-      return new FunctionType.internal(element,
-                                       newReturnType,
-                                       newParameterTypes,
-                                       newOptionalParameterTypes,
-                                       namedParameters,
-                                       newNamedParameterTypes);
+      return new FunctionType.internal(
+          element,
+          newReturnType,
+          newParameterTypes,
+          newOptionalParameterTypes,
+          namedParameters,
+          newNamedParameterTypes);
     }
     return this;
   }
 
-  DartType unalias(Compiler compiler) => this;
-
-  DartType get typeVariableOccurrence {
+  TypeVariableType get typeVariableOccurrence {
     TypeVariableType typeVariableType = returnType.typeVariableOccurrence;
     if (typeVariableType != null) return typeVariableType;
 
@@ -692,10 +673,10 @@ class FunctionType extends DartType {
   }
 
   void visitChildren(DartTypeVisitor visitor, var argument) {
-   returnType.accept(visitor, argument);
-   DartType.visitList(parameterTypes, visitor, argument);
-   DartType.visitList(optionalParameterTypes, visitor, argument);
-   DartType.visitList(namedParameterTypes, visitor, argument);
+    returnType.accept(visitor, argument);
+    DartType.visitList(parameterTypes, visitor, argument);
+    DartType.visitList(optionalParameterTypes, visitor, argument);
+    DartType.visitList(namedParameterTypes, visitor, argument);
   }
 
   String toString() {
@@ -724,7 +705,7 @@ class FunctionType extends DartType {
         }
         sb.write(namedParameterTypes[i]);
         sb.write(' ');
-          sb.write(namedParameters[i]);
+        sb.write(namedParameters[i]);
         first = false;
       }
       sb.write('}');
@@ -735,31 +716,27 @@ class FunctionType extends DartType {
 
   String get name => 'Function';
 
-  int computeArity() {
-    int arity = 0;
-    parameterTypes.forEach((_) { arity++; });
-    return arity;
-  }
+  int computeArity() => parameterTypes.length;
 
   int get hashCode {
     int hash = 3 * returnType.hashCode;
-    for (DartType parameter  in parameterTypes) {
+    for (DartType parameter in parameterTypes) {
       hash = 17 * hash + 5 * parameter.hashCode;
     }
-    for (DartType parameter  in optionalParameterTypes) {
+    for (DartType parameter in optionalParameterTypes) {
       hash = 19 * hash + 7 * parameter.hashCode;
     }
-    for (String name  in namedParameters) {
+    for (String name in namedParameters) {
       hash = 23 * hash + 11 * name.hashCode;
     }
-    for (DartType parameter  in namedParameterTypes) {
+    for (DartType parameter in namedParameterTypes) {
       hash = 29 * hash + 13 * parameter.hashCode;
     }
     return hash;
   }
 
   bool operator ==(other) {
-    if (other is !FunctionType) return false;
+    if (other is! FunctionType) return false;
     return returnType == other.returnType &&
         equalElements(parameterTypes, other.parameterTypes) &&
         equalElements(optionalParameterTypes, other.optionalParameterTypes) &&
@@ -769,13 +746,14 @@ class FunctionType extends DartType {
 }
 
 class TypedefType extends GenericType {
+  DartType _unaliased;
+
   TypedefType(TypedefElement element,
-              [List<DartType> typeArguments = const <DartType>[]])
+      [List<DartType> typeArguments = const <DartType>[]])
       : super(element, typeArguments);
 
   TypedefType.forUserProvidedBadType(TypedefElement element,
-                                     [List<DartType> typeArguments =
-                                         const <DartType>[]])
+      [List<DartType> typeArguments = const <DartType>[]])
       : super(element, typeArguments, checkTypeArgumentCount: false);
 
   TypedefElement get element => super.element;
@@ -788,11 +766,21 @@ class TypedefType extends GenericType {
     return new TypedefType(element, newTypeArguments);
   }
 
-  DartType unalias(Compiler compiler) {
-    element.ensureResolved(compiler);
-    element.checkCyclicReference(compiler);
-    DartType definition = element.alias.unalias(compiler);
-    return definition.substByContext(this);
+  void computeUnaliased(Resolution resolution) {
+    if (_unaliased == null) {
+      element.ensureResolved(resolution);
+      element.checkCyclicReference(resolution);
+      element.alias.computeUnaliased(resolution);
+      _unaliased = element.alias.unaliased.substByContext(this);
+    }
+  }
+
+  DartType get unaliased {
+    if (_unaliased == null) {
+      DartType definition = element.alias.unaliased;
+      _unaliased = definition.substByContext(this);
+    }
+    return _unaliased;
   }
 
   int get hashCode => super.hashCode;
@@ -802,21 +790,6 @@ class TypedefType extends GenericType {
   accept(DartTypeVisitor visitor, var argument) {
     return visitor.visitTypedefType(this, argument);
   }
-}
-
-/// A typedef which has already been resolved to its alias.
-class ResolvedTypedefType extends TypedefType {
-  FunctionType alias;
-
-  ResolvedTypedefType(TypedefElement element,
-                      List<DartType> typeArguments,
-                      this.alias)
-        : super(element, typeArguments) {
-    assert(invariant(element, alias != null,
-        message: 'Alias must be non-null on $element.'));
-  }
-
-  FunctionType unalias(Compiler compiler) => alias;
 }
 
 /**
@@ -833,13 +806,13 @@ class DynamicType extends DartType {
 
   TypeKind get kind => TypeKind.DYNAMIC;
 
-  DartType unalias(Compiler compiler) => this;
-
   DartType subst(List<DartType> arguments, List<DartType> parameters) => this;
 
   accept(DartTypeVisitor visitor, var argument) {
     return visitor.visitDynamicType(this, argument);
   }
+
+  int get hashCode => 91;
 
   String toString() => name;
 }
@@ -887,44 +860,73 @@ class InterfaceMember implements MemberSignature {
 abstract class DartTypeVisitor<R, A> {
   const DartTypeVisitor();
 
+  R visit(DartType type, A argument) => type.accept(this, argument);
+
+  R visitVoidType(VoidType type, A argument) => null;
+
+  R visitTypeVariableType(TypeVariableType type, A argument) => null;
+
+  R visitFunctionType(FunctionType type, A argument) => null;
+
+  R visitMalformedType(MalformedType type, A argument) => null;
+
+  R visitStatementType(StatementType type, A argument) => null;
+
+  R visitInterfaceType(InterfaceType type, A argument) => null;
+
+  R visitTypedefType(TypedefType type, A argument) => null;
+
+  R visitDynamicType(DynamicType type, A argument) => null;
+}
+
+abstract class BaseDartTypeVisitor<R, A> extends DartTypeVisitor<R, A> {
+  const BaseDartTypeVisitor();
+
   R visitType(DartType type, A argument);
 
-  R visitVoidType(VoidType type, A argument) =>
-      visitType(type, argument);
+  @override
+  R visitVoidType(VoidType type, A argument) => visitType(type, argument);
 
+  @override
   R visitTypeVariableType(TypeVariableType type, A argument) =>
       visitType(type, argument);
 
+  @override
   R visitFunctionType(FunctionType type, A argument) =>
       visitType(type, argument);
 
+  @override
   R visitMalformedType(MalformedType type, A argument) =>
       visitType(type, argument);
 
+  @override
   R visitStatementType(StatementType type, A argument) =>
       visitType(type, argument);
 
-  R visitGenericType(GenericType type, A argument) =>
-      visitType(type, argument);
+  R visitGenericType(GenericType type, A argument) => visitType(type, argument);
 
+  @override
   R visitInterfaceType(InterfaceType type, A argument) =>
       visitGenericType(type, argument);
 
+  @override
   R visitTypedefType(TypedefType type, A argument) =>
       visitGenericType(type, argument);
 
-  R visitDynamicType(DynamicType type, A argument) =>
-      visitType(type, argument);
+  @override
+  R visitDynamicType(DynamicType type, A argument) => visitType(type, argument);
 }
 
 /**
  * Abstract visitor for determining relations between types.
  */
-abstract class AbstractTypeRelation extends DartTypeVisitor<bool, DartType> {
-  final Compiler compiler;
-  CoreTypes get coreTypes => compiler.coreTypes;
+abstract class AbstractTypeRelation
+    extends BaseDartTypeVisitor<bool, DartType> {
+  final Resolution resolution;
 
-  AbstractTypeRelation(this.compiler);
+  AbstractTypeRelation(this.resolution);
+
+  CoreTypes get coreTypes => resolution.coreTypes;
 
   bool visitType(DartType t, DartType s) {
     throw 'internal error: unknown type kind ${t.kind}';
@@ -948,10 +950,9 @@ abstract class AbstractTypeRelation extends DartTypeVisitor<bool, DartType> {
   bool visitMalformedType(MalformedType t, DartType s) => true;
 
   bool visitInterfaceType(InterfaceType t, DartType s) {
-
     // TODO(johnniwinther): Currently needed since literal types like int,
     // double, bool etc. might not have been resolved yet.
-    t.element.ensureResolved(compiler);
+    t.element.ensureResolved(resolution);
 
     bool checkTypeArguments(InterfaceType instance, InterfaceType other) {
       List<DartType> tTypeArgs = instance.typeArguments;
@@ -977,7 +978,7 @@ abstract class AbstractTypeRelation extends DartTypeVisitor<bool, DartType> {
     if (s == coreTypes.functionType) {
       return true;
     }
-    if (s is !FunctionType) return false;
+    if (s is! FunctionType) return false;
     FunctionType tf = t;
     FunctionType sf = s;
     if (invalidFunctionReturnTypes(tf.returnType, sf.returnType)) {
@@ -1016,7 +1017,7 @@ abstract class AbstractTypeRelation extends DartTypeVisitor<bool, DartType> {
       return false;
     }
     if (!sf.namedParameters.isEmpty) {
-        // We must have [: len(t.p) == len(s.p) :].
+      // We must have [: len(t.p) == len(s.p) :].
       if (sNotEmpty) {
         return false;
       }
@@ -1101,7 +1102,7 @@ abstract class AbstractTypeRelation extends DartTypeVisitor<bool, DartType> {
 }
 
 class MoreSpecificVisitor extends AbstractTypeRelation {
-  MoreSpecificVisitor(Compiler compiler) : super(compiler);
+  MoreSpecificVisitor(Resolution resolution) : super(resolution);
 
   bool isMoreSpecific(DartType t, DartType s) {
     if (identical(t, s) || s.treatAsDynamic || t == coreTypes.nullType) {
@@ -1116,8 +1117,10 @@ class MoreSpecificVisitor extends AbstractTypeRelation {
     if (s == coreTypes.objectType) {
       return true;
     }
-    t = t.unalias(compiler);
-    s = s.unalias(compiler);
+    t.computeUnaliased(resolution);
+    t = t.unaliased;
+    s.computeUnaliased(resolution);
+    s = s.unaliased;
 
     return t.accept(this, s);
   }
@@ -1144,8 +1147,7 @@ class MoreSpecificVisitor extends AbstractTypeRelation {
  * Type visitor that determines the subtype relation two types.
  */
 class SubtypeVisitor extends MoreSpecificVisitor {
-
-  SubtypeVisitor(Compiler compiler) : super(compiler);
+  SubtypeVisitor(Resolution resolution) : super(resolution);
 
   bool isSubtype(DartType t, DartType s) {
     return t.treatAsDynamic || isMoreSpecific(t, s);
@@ -1189,10 +1191,8 @@ class SubtypeVisitor extends MoreSpecificVisitor {
  * substitute for the bound of [typeVariable]. [bound] holds the bound against
  * which [typeArgument] should be checked.
  */
-typedef void CheckTypeVariableBound(GenericType type,
-                                    DartType typeArgument,
-                                    TypeVariableType typeVariable,
-                                    DartType bound);
+typedef void CheckTypeVariableBound(GenericType type, DartType typeArgument,
+    TypeVariableType typeVariable, DartType bound);
 
 /// Basic interface for the Dart type system.
 abstract class DartTypes {
@@ -1201,36 +1201,70 @@ abstract class DartTypes {
 
   /// Returns `true` if [t] is a subtype of [s].
   bool isSubtype(DartType t, DartType s);
+
+  /// Returns `true` if [t] might be a subtype of [s] for some values of
+  /// type variables in [s] and [t].
+  bool isPotentialSubtype(DartType t, DartType s);
 }
 
 class Types implements DartTypes {
-  // TODO(johnniwinther): Replace by [CoreTypes].
-  final Compiler compiler;
+  final Resolution resolution;
   final MoreSpecificVisitor moreSpecificVisitor;
   final SubtypeVisitor subtypeVisitor;
   final PotentialSubtypeVisitor potentialSubtypeVisitor;
 
-  CoreTypes get coreTypes => compiler.coreTypes;
+  CoreTypes get coreTypes => resolution.coreTypes;
 
-  Types(Compiler compiler)
-      : this.compiler = compiler,
-        this.moreSpecificVisitor = new MoreSpecificVisitor(compiler),
-        this.subtypeVisitor = new SubtypeVisitor(compiler),
-        this.potentialSubtypeVisitor = new PotentialSubtypeVisitor(compiler);
+  DiagnosticReporter get reporter => resolution.reporter;
 
-  Types copy(Compiler compiler) {
-    return new Types(compiler);
+  Types(Resolution resolution)
+      : this.resolution = resolution,
+        this.moreSpecificVisitor = new MoreSpecificVisitor(resolution),
+        this.subtypeVisitor = new SubtypeVisitor(resolution),
+        this.potentialSubtypeVisitor = new PotentialSubtypeVisitor(resolution);
+
+  Types copy(Resolution resolution) {
+    return new Types(resolution);
   }
 
-  /** Returns true if [t] is more specific than [s]. */
+  /// Flatten [type] by recursively removing enclosing `Future` annotations.
+  ///
+  /// Defined in the language specification as:
+  ///
+  ///   If T = Future<S> then flatten(T) = flatten(S).
+  ///   Otherwise if T <: Future then let S be a type such that T << Future<S>
+  ///   and for all R, if T << Future<R> then S << R. Then flatten(T) =  S.
+  ///   In any other circumstance, flatten(T) = T.
+  ///
+  /// For instance:
+  ///     flatten(T) = T
+  ///     flatten(Future<T>) = T
+  ///     flatten(Future<Future<T>>) = T
+  ///
+  /// This method is used in the static typing of await and type checking of
+  /// return.
+  DartType flatten(DartType type) {
+    if (type is InterfaceType) {
+      if (type.element == coreTypes.futureClass) {
+        // T = Future<S>
+        return flatten(type.typeArguments.first);
+      }
+      InterfaceType futureType = type.asInstanceOf(coreTypes.futureClass);
+      if (futureType != null) {
+        // T << Future<S>
+        return futureType.typeArguments.single;
+      }
+    }
+    return type;
+  }
+
+  /// Returns true if [t] is more specific than [s].
   bool isMoreSpecific(DartType t, DartType s) {
     return moreSpecificVisitor.isMoreSpecific(t, s);
   }
 
-  /**
-   * Returns the most specific type of [t] and [s] or `null` if neither is more
-   * specific than the other.
-   */
+  /// Returns the most specific type of [t] and [s] or `null` if neither is more
+  /// specific than the other.
   DartType getMostSpecific(DartType t, DartType s) {
     if (isMoreSpecific(t, s)) {
       return t;
@@ -1271,8 +1305,8 @@ class Types implements DartTypes {
    * declared on [element]. Calls [checkTypeVariableBound] on each type
    * argument and bound.
    */
-  void checkTypeVariableBounds(GenericType type,
-                               CheckTypeVariableBound checkTypeVariableBound) {
+  void checkTypeVariableBounds(
+      GenericType type, CheckTypeVariableBound checkTypeVariableBound) {
     TypeDeclarationElement element = type.element;
     List<DartType> typeArguments = type.typeArguments;
     List<DartType> typeVariables = element.typeVariables;
@@ -1292,8 +1326,7 @@ class Types implements DartTypes {
    * instead of a newly created list.
    */
   static List<DartType> substTypes(List<DartType> types,
-                                   List<DartType> arguments,
-                                   List<DartType> parameters) {
+      List<DartType> arguments, List<DartType> parameters) {
     bool changed = false;
     List<DartType> result = new List<DartType>.generate(types.length, (index) {
       DartType type = types[index];
@@ -1353,9 +1386,7 @@ class Types implements DartTypes {
       return 1;
     }
     bool isDefinedByDeclaration(DartType type) {
-      return type.isInterfaceType ||
-             type.isTypedef ||
-             type.isTypeVariable;
+      return type.isInterfaceType || type.isTypedef || type.isTypeVariable;
     }
 
     if (isDefinedByDeclaration(a)) {
@@ -1372,7 +1403,7 @@ class Types implements DartTypes {
             return -1;
           } else {
             return compareList((a as GenericType).typeArguments,
-                               (b as GenericType).typeArguments);
+                (b as GenericType).typeArguments);
           }
         }
       } else {
@@ -1393,8 +1424,8 @@ class Types implements DartTypes {
         if (result != 0) return result;
         result = compareList(aFunc.parameterTypes, bFunc.parameterTypes);
         if (result != 0) return result;
-        result = compareList(aFunc.optionalParameterTypes,
-                             bFunc.optionalParameterTypes);
+        result = compareList(
+            aFunc.optionalParameterTypes, bFunc.optionalParameterTypes);
         if (result != 0) return result;
         // TODO(karlklose): reuse [compareList].
         Iterator<String> aNames = aFunc.namedParameters.iterator;
@@ -1410,8 +1441,8 @@ class Types implements DartTypes {
           // [bNames] is longer that [aNames] => a < b.
           return -1;
         }
-        return compareList(aFunc.namedParameterTypes,
-                           bFunc.namedParameterTypes);
+        return compareList(
+            aFunc.namedParameterTypes, bFunc.namedParameterTypes);
       } else {
         // [b] is a malformed or statement type => a < b.
         return -1;
@@ -1431,8 +1462,8 @@ class Types implements DartTypes {
       // [a] is a malformed type => a < b.
       return -1;
     }
-    assert (a.isMalformed);
-    assert (b.isMalformed);
+    assert(a.isMalformed);
+    assert(b.isMalformed);
     // TODO(johnniwinther): Can we do this better?
     return Elements.compareByPosition(a.element, b.element);
   }
@@ -1455,9 +1486,8 @@ class Types implements DartTypes {
   }
 
   /// Computes the least upper bound of two interface types [a] and [b].
-  InterfaceType computeLeastUpperBoundInterfaces(InterfaceType a,
-                                                 InterfaceType b) {
-
+  InterfaceType computeLeastUpperBoundInterfaces(
+      InterfaceType a, InterfaceType b) {
     /// Returns the set of supertypes of [type] at depth [depth].
     Set<DartType> getSupertypesAtDepth(InterfaceType type, int depth) {
       OrderedTypeSet types = type.element.allSupertypesAndSelf;
@@ -1480,15 +1510,15 @@ class Types implements DartTypes {
       }
     }
 
-    compiler.internalError(CURRENT_ELEMENT_SPANNABLE,
+    reporter.internalError(CURRENT_ELEMENT_SPANNABLE,
         'No least upper bound computed for $a and $b.');
     return null;
   }
 
   /// Computes the least upper bound of the types in the longest prefix of [a]
   /// and [b].
-  List<DartType> computeLeastUpperBoundsTypes(List<DartType> a,
-                                              List<DartType> b) {
+  List<DartType> computeLeastUpperBoundsTypes(
+      List<DartType> a, List<DartType> b) {
     if (a.isEmpty || b.isEmpty) return const <DartType>[];
     int prefixLength = min(a.length, b.length);
     List<DartType> types = new List<DartType>(prefixLength);
@@ -1509,17 +1539,15 @@ class Types implements DartTypes {
   /// bound of the longest common prefix of the optional parameters of [a] and
   /// [b], and the named parameters are the least upper bound of those common to
   /// [a] and [b].
-  DartType computeLeastUpperBoundFunctionTypes(FunctionType a,
-                                               FunctionType b) {
+  DartType computeLeastUpperBoundFunctionTypes(FunctionType a, FunctionType b) {
     if (a.parameterTypes.length != b.parameterTypes.length) {
       return coreTypes.functionType;
     }
     DartType returnType = computeLeastUpperBound(a.returnType, b.returnType);
     List<DartType> parameterTypes =
         computeLeastUpperBoundsTypes(a.parameterTypes, b.parameterTypes);
-    List<DartType> optionalParameterTypes =
-        computeLeastUpperBoundsTypes(a.optionalParameterTypes,
-                                     b.optionalParameterTypes);
+    List<DartType> optionalParameterTypes = computeLeastUpperBoundsTypes(
+        a.optionalParameterTypes, b.optionalParameterTypes);
     List<String> namedParameters = <String>[];
     List<String> aNamedParameters = a.namedParameters;
     List<String> bNamedParameters = b.namedParameters;
@@ -1528,10 +1556,8 @@ class Types implements DartTypes {
     List<DartType> bNamedParameterTypes = b.namedParameterTypes;
     int aIndex = 0;
     int bIndex = 0;
-    int prefixLength =
-        min(aNamedParameterTypes.length, bNamedParameterTypes.length);
-    while (aIndex < aNamedParameters.length &&
-           bIndex < bNamedParameters.length) {
+    while (
+        aIndex < aNamedParameters.length && bIndex < bNamedParameters.length) {
       String aNamedParameter = aNamedParameters[aIndex];
       String bNamedParameter = bNamedParameters[bIndex];
       int result = aNamedParameter.compareTo(bNamedParameter);
@@ -1547,18 +1573,15 @@ class Types implements DartTypes {
         bIndex++;
       }
     }
-    return new FunctionType.synthesized(
-        returnType,
-        parameterTypes, optionalParameterTypes,
-        namedParameters, namedParameterTypes);
+    return new FunctionType.synthesized(returnType, parameterTypes,
+        optionalParameterTypes, namedParameters, namedParameterTypes);
   }
 
   /// Computes the least upper bound of two types of which at least one is a
   /// type variable. The least upper bound of a type variable is defined in
   /// terms of its bound, but to ensure reflexivity we need to check for common
   /// bounds transitively.
-  DartType computeLeastUpperBoundTypeVariableTypes(DartType a,
-                                                   DartType b) {
+  DartType computeLeastUpperBoundTypeVariableTypes(DartType a, DartType b) {
     Set<DartType> typeVariableBounds = new Set<DartType>();
     while (a.isTypeVariable) {
       if (a == b) return a;
@@ -1578,13 +1601,14 @@ class Types implements DartTypes {
   DartType computeLeastUpperBound(DartType a, DartType b) {
     if (a == b) return a;
 
-    if (a.isTypeVariable ||
-           b.isTypeVariable) {
+    if (a.isTypeVariable || b.isTypeVariable) {
       return computeLeastUpperBoundTypeVariableTypes(a, b);
     }
 
-    a = a.unalias(compiler);
-    b = b.unalias(compiler);
+    a.computeUnaliased(resolution);
+    a = a.unaliased;
+    b.computeUnaliased(resolution);
+    b = b.unaliased;
 
     if (a.treatAsDynamic || b.treatAsDynamic) return const DynamicType();
     if (a.isVoid || b.isVoid) return const VoidType();
@@ -1605,6 +1629,90 @@ class Types implements DartTypes {
     }
     return const DynamicType();
   }
+
+  /// Computes the unaliased type of the first non type variable bound of
+  /// [type].
+  ///
+  /// This is used to normalize malformed types, type variables and typedef
+  /// before use in typechecking.
+  ///
+  /// Malformed types are normalized to `dynamic`. Typedefs are normalized to
+  /// their alias, or `dynamic` if cyclic. Type variables are normalized to the
+  /// normalized type of their bound, or `Object` if cyclic.
+  ///
+  /// For instance for these types:
+  ///
+  ///     class Foo<T extends Bar, S extends T, U extends Baz> {}
+  ///     class Bar<X extends Y, Y extends X> {}
+  ///     typedef Baz();
+  ///
+  /// the unaliased bounds types are:
+  ///
+  ///     unaliasedBound(Foo) = Foo
+  ///     unaliasedBound(Bar) = Bar
+  ///     unaliasedBound(Unresolved) = `dynamic`
+  ///     unaliasedBound(Baz) = ()->dynamic
+  ///     unaliasedBound(T) = Bar
+  ///     unaliasedBound(S) = unaliasedBound(T) = Bar
+  ///     unaliasedBound(U) = unaliasedBound(Baz) = ()->dynamic
+  ///     unaliasedBound(X) = unaliasedBound(Y) = `Object`
+  ///
+  static DartType computeUnaliasedBound(Resolution resolution, DartType type) {
+    DartType originalType = type;
+    while (type.isTypeVariable) {
+      TypeVariableType variable = type;
+      type = variable.element.bound;
+      if (type == originalType) {
+        type = resolution.coreTypes.objectType;
+      }
+    }
+    if (type.isMalformed) {
+      return const DynamicType();
+    }
+    type.computeUnaliased(resolution);
+    return type.unaliased;
+  }
+
+  /// Computes the interface type of [type], which is the type that defines
+  /// the property of [type].
+  ///
+  /// For an interface type it is the type itself, for a type variable it is the
+  /// interface type of the bound, for function types and typedefs it is the
+  /// `Function` type. For other types, like `dynamic`, `void` and malformed
+  /// types, there is no interface type and `null` is returned.
+  ///
+  /// For instance for these types:
+  ///
+  ///     class Foo<T extends Bar, S extends T, U extends Baz> {}
+  ///     class Bar {}
+  ///     typedef Baz();
+  ///
+  /// the interface types are:
+  ///
+  ///     interfaceType(Foo) = Foo
+  ///     interfaceType(Bar) = Bar
+  ///     interfaceType(Baz) = interfaceType(()->dynamic) = Function
+  ///     interfaceType(T) = interfaceType(Bar) = Bar
+  ///     interfaceType(S) = interfaceType(T) = interfaceType(Bar) = Bar
+  ///     interfaceType(U) = interfaceType(Baz)
+  ///                      = intefaceType(()->dynamic) = Function
+  ///
+  /// When typechecking `o.foo` the interface type of the static type of `o` is
+  /// used to lookup the existence and type of `foo`.
+  ///
+  static InterfaceType computeInterfaceType(
+      Resolution resolution, DartType type) {
+    type = computeUnaliasedBound(resolution, type);
+    if (type.treatAsDynamic) {
+      return null;
+    }
+    if (type.isFunctionType) {
+      type = resolution.coreTypes.functionType;
+    }
+    assert(invariant(NO_LOCATION_SPANNABLE, type.isInterfaceType,
+        message: "unexpected type kind ${type.kind}."));
+    return type;
+  }
 }
 
 /**
@@ -1613,7 +1721,7 @@ class Types implements DartTypes {
  * [:false:] only if we are sure no such substitution exists.
  */
 class PotentialSubtypeVisitor extends SubtypeVisitor {
-  PotentialSubtypeVisitor(Compiler compiler) : super(compiler);
+  PotentialSubtypeVisitor(Resolution resolution) : super(resolution);
 
   bool isSubtype(DartType t, DartType s) {
     if (t is TypeVariableType || s is TypeVariableType) {
@@ -1630,19 +1738,19 @@ class PotentialSubtypeVisitor extends SubtypeVisitor {
 /// visited type by structurally matching it with the argument type. If the
 /// constraints are too complex or the two types are too different, `false`
 /// is returned. Otherwise, the [constraintMap] holds the valid constraints.
-class MoreSpecificSubtypeVisitor extends DartTypeVisitor<bool, DartType> {
-  final Compiler compiler;
+class MoreSpecificSubtypeVisitor extends BaseDartTypeVisitor<bool, DartType> {
+  final Types types;
   Map<TypeVariableType, DartType> constraintMap;
 
-  MoreSpecificSubtypeVisitor(Compiler this.compiler);
+  MoreSpecificSubtypeVisitor(this.types);
 
   /// Compute an instance of [element] which is more specific than [supertype].
   /// If no instance is found, `null` is returned.
   ///
   /// Note that this computation is a heuristic. It does not find a suggestion
   /// in all possible cases.
-  InterfaceType computeMoreSpecific(ClassElement element,
-                                    InterfaceType supertype) {
+  InterfaceType computeMoreSpecific(
+      ClassElement element, InterfaceType supertype) {
     InterfaceType supertypeInstance =
         element.thisType.asInstanceOf(supertype.element);
     if (supertypeInstance == null) return null;
@@ -1661,7 +1769,7 @@ class MoreSpecificSubtypeVisitor extends DartTypeVisitor<bool, DartType> {
   }
 
   bool visitType(DartType type, DartType argument) {
-    return compiler.types.isMoreSpecific(type, argument);
+    return types.isMoreSpecific(type, argument);
   }
 
   bool visitTypes(List<DartType> a, List<DartType> b) {
@@ -1673,16 +1781,14 @@ class MoreSpecificSubtypeVisitor extends DartTypeVisitor<bool, DartType> {
   }
 
   bool visitTypeVariableType(TypeVariableType type, DartType argument) {
-    DartType constraint =
-        compiler.types.getMostSpecific(constraintMap[type], argument);
+    DartType constraint = types.getMostSpecific(constraintMap[type], argument);
     constraintMap[type] = constraint;
     return constraint != null;
   }
 
   bool visitFunctionType(FunctionType type, DartType argument) {
     if (argument is FunctionType) {
-      if (type.parameterTypes.length !=
-          argument.parameterTypes.length) {
+      if (type.parameterTypes.length != argument.parameterTypes.length) {
         return false;
       }
       if (type.optionalParameterTypes.length !=
@@ -1697,8 +1803,8 @@ class MoreSpecificSubtypeVisitor extends DartTypeVisitor<bool, DartType> {
       if (visitTypes(type.parameterTypes, argument.parameterTypes)) {
         return false;
       }
-      if (visitTypes(type.optionalParameterTypes,
-                     argument.optionalParameterTypes)) {
+      if (visitTypes(
+          type.optionalParameterTypes, argument.optionalParameterTypes)) {
         return false;
       }
       return visitTypes(type.namedParameterTypes, argument.namedParameterTypes);
@@ -1718,7 +1824,7 @@ class MoreSpecificSubtypeVisitor extends DartTypeVisitor<bool, DartType> {
 /// Visitor used to print type annotation like they used in the source code.
 /// The visitor is especially for printing a function type like
 /// `(Foo,[Bar])->Baz` as `Baz m(Foo a1, [Bar a2])`.
-class TypeDeclarationFormatter extends DartTypeVisitor<dynamic, String> {
+class TypeDeclarationFormatter extends BaseDartTypeVisitor<dynamic, String> {
   Set<String> usedNames;
   StringBuffer sb;
 
@@ -1746,7 +1852,7 @@ class TypeDeclarationFormatter extends DartTypeVisitor<dynamic, String> {
     return proposal;
   }
 
-  void visit(DartType type) {
+  void visit(DartType type, [_]) {
     type.accept(this, null);
   }
 
@@ -1822,4 +1928,3 @@ class TypeDeclarationFormatter extends DartTypeVisitor<dynamic, String> {
     sb.write(')');
   }
 }
-

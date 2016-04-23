@@ -8,29 +8,31 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
-
-import '../compiler.dart' as api show Diagnostic, DiagnosticHandler;
-import 'dart2js.dart' show AbortLeg;
-import 'colors.dart' as colors;
-import 'io/source_file.dart';
-import 'filenames.dart';
-import 'util/uri_extras.dart';
 import 'dart:typed_data';
+
+import '../compiler.dart' as api show Diagnostic;
+import '../compiler_new.dart' as api;
+import '../compiler_new.dart';
+import 'colors.dart' as colors;
+import 'dart2js.dart' show AbortLeg;
+import 'filenames.dart';
+import 'io/source_file.dart';
+import 'util/uri_extras.dart';
 
 List<int> readAll(String filename) {
   var file = (new File(filename)).openSync();
   var length = file.lengthSync();
   // +1 to have a 0 terminated list, see [Scanner].
   var buffer = new Uint8List(length + 1);
-  var bytes = file.readIntoSync(buffer, 0, length);
+  file.readIntoSync(buffer, 0, length);
   file.closeSync();
   return buffer;
 }
 
-abstract class SourceFileProvider {
+abstract class SourceFileProvider implements CompilerInput {
   bool isWindows = (Platform.operatingSystem == 'windows');
   Uri cwd = currentDirectory;
-  Map<String, SourceFile> sourceFiles = <String, SourceFile>{};
+  Map<Uri, SourceFile> sourceFiles = <Uri, SourceFile>{};
   int dartCharactersRead = 0;
 
   Future<String> readStringFromUri(Uri resourceUri) {
@@ -54,60 +56,69 @@ abstract class SourceFileProvider {
       source = readAll(resourceUri.toFilePath());
     } on FileSystemException catch (ex) {
       OSError ose = ex.osError;
-      String detail = (ose != null && ose.message != null)
-          ? ' (${ose.message})'
-          : '';
+      String detail =
+          (ose != null && ose.message != null) ? ' (${ose.message})' : '';
       return new Future.error(
           "Error reading '${relativize(cwd, resourceUri, isWindows)}'"
           "$detail");
     }
     dartCharactersRead += source.length;
-    sourceFiles[resourceUri.toString()] =
-        new CachingUtf8BytesSourceFile(relativizeUri(resourceUri), source);
+    sourceFiles[resourceUri] = new CachingUtf8BytesSourceFile(
+        resourceUri, relativizeUri(resourceUri), source);
     return new Future.value(source);
   }
 
   Future<List<int>> _readFromHttp(Uri resourceUri) {
     assert(resourceUri.scheme == 'http');
     HttpClient client = new HttpClient();
-    return client.getUrl(resourceUri)
+    return client
+        .getUrl(resourceUri)
         .then((HttpClientRequest request) => request.close())
         .then((HttpClientResponse response) {
-          if (response.statusCode != HttpStatus.OK) {
-            String msg = 'Failure getting $resourceUri: '
-                      '${response.statusCode} ${response.reasonPhrase}';
-            throw msg;
-          }
-          return response.toList();
-        })
-        .then((List<List<int>> splitContent) {
-           int totalLength = splitContent.fold(0, (int old, List list) {
-             return old + list.length;
-           });
-           Uint8List result = new Uint8List(totalLength);
-           int offset = 0;
-           for (List<int> contentPart in splitContent) {
-             result.setRange(
-                 offset, offset + contentPart.length, contentPart);
-             offset += contentPart.length;
-           }
-           dartCharactersRead += totalLength;
-           sourceFiles[resourceUri.toString()] =
-               new CachingUtf8BytesSourceFile(resourceUri.toString(), result);
-           return result;
-         });
+      if (response.statusCode != HttpStatus.OK) {
+        String msg = 'Failure getting $resourceUri: '
+            '${response.statusCode} ${response.reasonPhrase}';
+        throw msg;
+      }
+      return response.toList();
+    }).then((List<List<int>> splitContent) {
+      int totalLength = splitContent.fold(0, (int old, List list) {
+        return old + list.length;
+      });
+      Uint8List result = new Uint8List(totalLength);
+      int offset = 0;
+      for (List<int> contentPart in splitContent) {
+        result.setRange(offset, offset + contentPart.length, contentPart);
+        offset += contentPart.length;
+      }
+      dartCharactersRead += totalLength;
+      sourceFiles[resourceUri] = new CachingUtf8BytesSourceFile(
+          resourceUri, resourceUri.toString(), result);
+      return result;
+    });
   }
 
+  // TODO(johnniwinther): Remove this when no longer needed for the old compiler
+  // API.
   Future/*<List<int> | String>*/ call(Uri resourceUri);
 
   relativizeUri(Uri uri) => relativize(cwd, uri, isWindows);
+
+  SourceFile getSourceFile(Uri resourceUri) {
+    return sourceFiles[resourceUri];
+  }
 }
 
 class CompilerSourceFileProvider extends SourceFileProvider {
-  Future<List<int>> call(Uri resourceUri) => readUtf8BytesFromUri(resourceUri);
+  // TODO(johnniwinther): Remove this when no longer needed for the old compiler
+  // API.
+  Future<List<int>> call(Uri resourceUri) => readFromUri(resourceUri);
+
+  @override
+  Future readFromUri(Uri uri) => readUtf8BytesFromUri(uri);
 }
 
-class FormattingDiagnosticHandler {
+class FormattingDiagnosticHandler implements CompilerDiagnostics {
   final SourceFileProvider provider;
   bool showWarnings = true;
   bool showHints = true;
@@ -125,7 +136,7 @@ class FormattingDiagnosticHandler {
 
   FormattingDiagnosticHandler([SourceFileProvider provider])
       : this.provider =
-          (provider == null) ? new CompilerSourceFileProvider() : provider;
+            (provider == null) ? new CompilerSourceFileProvider() : provider;
 
   void info(var message, [api.Diagnostic kind = api.Diagnostic.VERBOSE_INFO]) {
     if (!verbose && kind == api.Diagnostic.VERBOSE_INFO) return;
@@ -154,8 +165,9 @@ class FormattingDiagnosticHandler {
     throw 'Unexpected diagnostic kind: $kind (${kind.ordinal})';
   }
 
-  void diagnosticHandler(Uri uri, int begin, int end, String message,
-                         api.Diagnostic kind) {
+  @override
+  void report(var code, Uri uri, int begin, int end, String message,
+      api.Diagnostic kind) {
     // TODO(ahe): Remove this when source map is handled differently.
     if (identical(kind.name, 'source map')) return;
 
@@ -171,10 +183,9 @@ class FormattingDiagnosticHandler {
 
     message = prefixMessage(message, kind);
 
-    // [previousKind]/[lastKind] records the previous non-INFO kind we saw.
+    // [lastKind] records the previous non-INFO kind we saw.
     // This is used to suppress info about a warning when warnings are
     // suppressed, and similar for hints.
-    var previousKind = lastKind;
     if (kind != api.Diagnostic.INFO) {
       lastKind = kind;
     }
@@ -202,14 +213,14 @@ class FormattingDiagnosticHandler {
     if (uri == null) {
       print('${color(message)}');
     } else {
-      SourceFile file = provider.sourceFiles[uri.toString()];
+      SourceFile file = provider.sourceFiles[uri];
       if (file != null) {
-        print(file.getLocationMessage(
-          color(message), begin, end, colorize: color));
+        print(file.getLocationMessage(color(message), begin, end,
+            colorize: color));
       } else {
         String position = end - begin > 0 ? '@$begin+${end - begin}' : '';
         print('${provider.relativizeUri(uri)}$position:\n'
-              '${color(message)}');
+            '${color(message)}');
       }
     }
     if (fatal && ++fatalCount >= throwOnErrorCount && throwOnError) {
@@ -218,8 +229,10 @@ class FormattingDiagnosticHandler {
     }
   }
 
+  // TODO(johnniwinther): Remove this when no longer needed for the old compiler
+  // API.
   void call(Uri uri, int begin, int end, String message, api.Diagnostic kind) {
-    return diagnosticHandler(uri, begin, end, message, kind);
+    return report(null, uri, begin, end, message, kind);
   }
 }
 
@@ -234,10 +247,8 @@ class RandomAccessFileOutputProvider {
   int totalCharactersWritten = 0;
   List<String> allOutputFiles = new List<String>();
 
-  RandomAccessFileOutputProvider(this.out,
-                                 this.sourceMapOut,
-                                 {this.onInfo,
-                                  this.onFailure});
+  RandomAccessFileOutputProvider(this.out, this.sourceMapOut,
+      {this.onInfo, this.onFailure});
 
   static Uri computePrecompiledUri(Uri out) {
     String extension = 'precompiled.js';
@@ -252,7 +263,6 @@ class RandomAccessFileOutputProvider {
 
   EventSink<String> call(String name, String extension) {
     Uri uri;
-    String sourceMapFileName;
     bool isPrimaryOutput = false;
     // TODO (johnniwinther, sigurdm): Make a better interface for
     // output-providers.
@@ -262,12 +272,10 @@ class RandomAccessFileOutputProvider {
       if (extension == 'js' || extension == 'dart') {
         isPrimaryOutput = true;
         uri = out;
-        sourceMapFileName =
-            sourceMapOut.path.substring(sourceMapOut.path.lastIndexOf('/') + 1);
       } else if (extension == 'precompiled.js') {
         uri = computePrecompiledUri(out);
         onInfo("File ($uri) is compatible with header"
-               " \"Content-Security-Policy: script-src 'self'\"");
+            " \"Content-Security-Policy: script-src 'self'\"");
       } else if (extension == 'js.map' || extension == 'dart.map') {
         uri = sourceMapOut;
       } else if (extension == "info.json") {
@@ -287,7 +295,7 @@ class RandomAccessFileOutputProvider {
     RandomAccessFile output;
     try {
       output = new File(uri.toFilePath()).openSync(mode: FileMode.WRITE);
-    } on FileSystemException catch(e) {
+    } on FileSystemException catch (e) {
       onFailure('$e');
     }
 
@@ -297,7 +305,7 @@ class RandomAccessFileOutputProvider {
 
     writeStringSync(String data) {
       // Write the data in chunks of 8kb, otherwise we risk running OOM.
-      int chunkSize = 8*1024;
+      int chunkSize = 8 * 1024;
 
       int offset = 0;
       while (offset < data.length) {

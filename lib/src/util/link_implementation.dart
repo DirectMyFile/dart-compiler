@@ -52,7 +52,7 @@ class MappedLinkIterable<S, T> extends IterableBase<T> {
   MappedLinkIterable(this._link, this._transformation);
 
   Iterator<T> get iterator {
-    return new MappedLinkIterator<S,T>(_link, _transformation);
+    return new MappedLinkIterator<S, T>(_link, _transformation);
   }
 }
 
@@ -61,7 +61,7 @@ class LinkEntry<T> extends Link<T> {
   Link<T> tail;
 
   LinkEntry(T this.head, [Link<T> tail])
-    : this.tail = ((tail == null) ? new Link<T>() : tail);
+      : this.tail = ((tail == null) ? new Link<T>() : tail);
 
   Link<T> prepend(T element) {
     // TODO(ahe): Use new Link<T>, but this cost 8% performance on VM.
@@ -71,7 +71,7 @@ class LinkEntry<T> extends Link<T> {
   void printOn(StringBuffer buffer, [separatedBy]) {
     buffer.write(head);
     if (separatedBy == null) separatedBy = '';
-    for (Link link = tail; !link.isEmpty; link = link.tail) {
+    for (Link link = tail; link.isNotEmpty; link = link.tail) {
       buffer.write(separatedBy);
       buffer.write(link.head);
     }
@@ -87,7 +87,7 @@ class LinkEntry<T> extends Link<T> {
 
   Link<T> reverse() {
     Link<T> result = const Link();
-    for (Link<T> link = this; !link.isEmpty; link = link.tail) {
+    for (Link<T> link = this; link.isNotEmpty; link = link.tail) {
       result = result.prepend(link.head);
     }
     return result;
@@ -95,7 +95,7 @@ class LinkEntry<T> extends Link<T> {
 
   Link<T> reversePrependAll(Link<T> from) {
     Link<T> result;
-    for (result = this; !from.isEmpty; from = from.tail) {
+    for (result = this; from.isNotEmpty; from = from.tail) {
       result = result.prepend(from.head);
     }
     return result;
@@ -103,7 +103,7 @@ class LinkEntry<T> extends Link<T> {
 
   Link<T> skip(int n) {
     Link<T> link = this;
-    for (int i = 0 ; i < n ; i++) {
+    for (int i = 0; i < n; i++) {
       if (link.isEmpty) {
         throw new RangeError('Index $n out of range');
       }
@@ -113,17 +113,18 @@ class LinkEntry<T> extends Link<T> {
   }
 
   bool get isEmpty => false;
+  bool get isNotEmpty => true;
 
   void forEach(void f(T element)) {
-    for (Link<T> link = this; !link.isEmpty; link = link.tail) {
+    for (Link<T> link = this; link.isNotEmpty; link = link.tail) {
       f(link.head);
     }
   }
 
   bool operator ==(other) {
-    if (other is !Link<T>) return false;
+    if (other is! Link<T>) return false;
     Link<T> myElements = this;
-    while (!myElements.isEmpty && !other.isEmpty) {
+    while (myElements.isNotEmpty && other.isNotEmpty) {
       if (myElements.head != other.head) {
         return false;
       }
@@ -135,12 +136,18 @@ class LinkEntry<T> extends Link<T> {
 
   int get hashCode => throw new UnsupportedError('LinkEntry.hashCode');
 
-  int slowLength() => 1 + tail.slowLength();
+  int slowLength() {
+    int length = 0;
+    for (Link current = this; current.isNotEmpty; current = current.tail) {
+      ++length;
+    }
+    return length;
+  }
 
   Link copyWithout(e) {
     LinkBuilder copy = new LinkBuilder();
     Link link = this;
-    for (; !link.isEmpty; link = link.tail) {
+    for (; link.isNotEmpty; link = link.tail) {
       if (link.head != e) {
         copy.addLast(link.head);
       }
@@ -162,6 +169,7 @@ class LinkBuilderImplementation<T> implements LinkBuilder<T> {
     Link<T> link = head;
     lastLink = null;
     head = null;
+    length = 0;
     return link;
   }
 
@@ -170,17 +178,18 @@ class LinkBuilderImplementation<T> implements LinkBuilder<T> {
     List<T> list = new List<T>(length);
     int index = 0;
     Link<T> link = head;
-    while (!link.isEmpty) {
+    while (link.isNotEmpty) {
       list[index] = link.head;
       link = link.tail;
       index++;
     }
     lastLink = null;
     head = null;
+    length = 0;
     return list;
   }
 
-  void addLast(T t) {
+  Link<T> addLast(T t) {
     length++;
     LinkEntry<T> entry = new LinkEntry<T>(t, null);
     if (head == null) {
@@ -189,7 +198,21 @@ class LinkBuilderImplementation<T> implements LinkBuilder<T> {
       lastLink.tail = entry;
     }
     lastLink = entry;
+    return entry;
   }
 
   bool get isEmpty => length == 0;
+
+  T get first {
+    if (head != null) {
+      return head.head;
+    }
+    throw new StateError("no elements");
+  }
+
+  void clear() {
+    head = null;
+    lastLink = null;
+    length = 0;
+  }
 }

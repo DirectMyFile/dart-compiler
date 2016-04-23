@@ -2,11 +2,19 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of type_graph_inferrer;
+library compiler.src.inferrer.closure_tracer;
+
+import '../types/types.dart' show TypeMask;
+import '../common/names.dart' show Names;
+import '../elements/elements.dart';
+import '../universe/selector.dart' show Selector;
+import 'node_tracer.dart';
+import 'type_graph_nodes.dart';
+import 'debug.dart' as debug;
 
 class ClosureTracerVisitor extends TracerVisitor<ApplyableTypeInformation> {
   final Iterable<FunctionElement> tracedElements;
-  final List<CallSiteTypeInformation> callsToAnalyze =
+  final List<CallSiteTypeInformation> _callsToAnalyze =
       new List<CallSiteTypeInformation>();
 
   ClosureTracerVisitor(this.tracedElements, tracedType, inferrer)
@@ -15,8 +23,8 @@ class ClosureTracerVisitor extends TracerVisitor<ApplyableTypeInformation> {
   void run() {
     analyze();
     if (!continueAnalyzing) return;
-    callsToAnalyze.forEach(analyzeCall);
-    for(FunctionElement e in tracedElements) {
+    _callsToAnalyze.forEach(_analyzeCall);
+    for (FunctionElement e in tracedElements) {
       e.functionSignature.forEachParameter((Element parameter) {
         ElementTypeInformation info =
             inferrer.types.getInferredTypeOf(parameter);
@@ -25,67 +33,70 @@ class ClosureTracerVisitor extends TracerVisitor<ApplyableTypeInformation> {
     }
   }
 
-  void tagAsFunctionApplyTarget([String reason]) {
+  void _tagAsFunctionApplyTarget([String reason]) {
     tracedType.mightBePassedToFunctionApply = true;
-    if (_VERBOSE) {
+    if (debug.VERBOSE) {
       print("Closure $tracedType might be passed to apply: $reason");
     }
   }
 
-  void registerCallForLaterAnalysis(CallSiteTypeInformation info) {
-    callsToAnalyze.add(info);
+  void _registerCallForLaterAnalysis(CallSiteTypeInformation info) {
+    _callsToAnalyze.add(info);
   }
 
-  void analyzeCall(CallSiteTypeInformation info) {
+  void _analyzeCall(CallSiteTypeInformation info) {
     Selector selector = info.selector;
+    TypeMask mask = info.mask;
     tracedElements.forEach((FunctionElement functionElement) {
       if (!selector.signatureApplies(functionElement)) return;
-      inferrer.updateParameterAssignments(info, functionElement, info.arguments,
-          selector, remove: false, addToQueue: false);
+      inferrer.updateParameterAssignments(
+          info, functionElement, info.arguments, selector, mask,
+          remove: false, addToQueue: false);
     });
   }
 
+  @override
   visitClosureCallSiteTypeInformation(ClosureCallSiteTypeInformation info) {
     super.visitClosureCallSiteTypeInformation(info);
     if (info.closure == currentUser) {
-      registerCallForLaterAnalysis(info);
+      _registerCallForLaterAnalysis(info);
     } else {
       bailout('Passed to a closure');
     }
   }
 
+  @override
   visitStaticCallSiteTypeInformation(StaticCallSiteTypeInformation info) {
     super.visitStaticCallSiteTypeInformation(info);
     Element called = info.calledElement;
-    if (called.isForeign(compiler.backend)) {
+    if (compiler.backend.isForeign(called)) {
       String name = called.name;
       if (name == 'JS' || name == 'DART_CLOSURE_TO_JS') {
         bailout('Used in JS ${info.call}');
       }
     }
-    if (called.isGetter
-        && info.selector != null
-        && info.selector.isCall
-        && inferrer.types.getInferredTypeOf(called) == currentUser) {
+    if (called.isGetter &&
+        info.selector != null &&
+        info.selector.isCall &&
+        inferrer.types.getInferredTypeOf(called) == currentUser) {
       // This node can be a closure call as well. For example, `foo()`
       // where `foo` is a getter.
-      registerCallForLaterAnalysis(info);
+      _registerCallForLaterAnalysis(info);
     }
-    if (checkIfFunctionApply(called) &&
+    if (_checkIfFunctionApply(called) &&
         info.arguments != null &&
         info.arguments.contains(currentUser)) {
-      tagAsFunctionApplyTarget("static call");
+      _tagAsFunctionApplyTarget("static call");
     }
   }
 
-  bool checkIfCurrentUser(element) {
-    return inferrer.types.getInferredTypeOf(element) == currentUser;
-  }
+  bool _checkIfCurrentUser(element) =>
+      inferrer.types.getInferredTypeOf(element) == currentUser;
 
-  bool checkIfFunctionApply(element) {
-    return compiler.functionApplyMethod == element;
-  }
+  bool _checkIfFunctionApply(element) =>
+      compiler.functionApplyMethod == element;
 
+  @override
   visitDynamicCallSiteTypeInformation(DynamicCallSiteTypeInformation info) {
     super.visitDynamicCallSiteTypeInformation(info);
     if (info.selector.isCall) {
@@ -93,14 +104,14 @@ class ClosureTracerVisitor extends TracerVisitor<ApplyableTypeInformation> {
         if (!info.targets.every((element) => element.isFunction)) {
           bailout('Passed to a closure');
         }
-        if (info.targets.any(checkIfFunctionApply)) {
-          tagAsFunctionApplyTarget("dynamic call");
+        if (info.targets.any(_checkIfFunctionApply)) {
+          _tagAsFunctionApplyTarget("dynamic call");
         }
-      } else if (info.targets.any((element) => checkIfCurrentUser(element))) {
-        registerCallForLaterAnalysis(info);
+      } else if (info.targets.any((element) => _checkIfCurrentUser(element))) {
+        _registerCallForLaterAnalysis(info);
       }
     } else if (info.selector.isGetter &&
-        info.selector.name == Compiler.CALL_OPERATOR_NAME) {
+        info.selector.memberName == Names.call) {
       // We are potentially tearing off ourself here
       addNewEscapeInformation(info);
     }
@@ -111,11 +122,12 @@ class StaticTearOffClosureTracerVisitor extends ClosureTracerVisitor {
   StaticTearOffClosureTracerVisitor(tracedElement, tracedType, inferrer)
       : super([tracedElement], tracedType, inferrer);
 
+  @override
   visitStaticCallSiteTypeInformation(StaticCallSiteTypeInformation info) {
     super.visitStaticCallSiteTypeInformation(info);
-    if (info.calledElement == tracedElements.first
-        && info.selector != null
-        && info.selector.isGetter) {
+    if (info.calledElement == tracedElements.first &&
+        info.selector != null &&
+        info.selector.isGetter) {
       addNewEscapeInformation(info);
     }
   }

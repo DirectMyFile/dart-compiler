@@ -5,8 +5,8 @@
 part of dart2js.js_emitter;
 
 class NativeEmitter {
-
-  final Map<Element, ClassBuilder> cachedBuilders;
+  // TODO(floitsch): the native-emitter should not know about ClassBuilders.
+  final Map<Element, full_js_emitter.ClassBuilder> cachedBuilders;
 
   final CodeEmitterTask emitterTask;
 
@@ -22,11 +22,6 @@ class NativeEmitter {
   // Caches the methods that have a native body.
   Set<FunctionElement> nativeMethods;
 
-  // Do we need the native emitter to take care of handling
-  // noSuchMethod for us? This flag is set to true in the emitter if
-  // it finds any native class that needs noSuchMethod handling.
-  bool handleNoSuchMethod = false;
-
   NativeEmitter(CodeEmitterTask emitterTask)
       : this.emitterTask = emitterTask,
         subtypes = new Map<ClassElement, List<ClassElement>>(),
@@ -35,15 +30,20 @@ class NativeEmitter {
         cachedBuilders = emitterTask.compiler.cacheStrategy.newMap();
 
   Compiler get compiler => emitterTask.compiler;
+
   JavaScriptBackend get backend => compiler.backend;
 
-  jsAst.Expression get defPropFunction {
-    Element element = backend.findHelper('defineProperty');
-    return emitterTask.staticFunctionAccess(element);
-  }
+  BackendHelpers get helpers => backend.helpers;
 
   /**
-   * Writes code to associate dispatch tags with interceptors to [nativeBuffer].
+   * Prepares native classes for emission. Returns the unneeded classes.
+   *
+   * Removes trivial classes (that can be represented by a super type) and
+   * generates properties that have to be added to classes (native or not).
+   *
+   * Updates the `nativeLeafTags`, `nativeNonLeafTags` and `nativeExtensions`
+   * fields of the given classes. This data must be emitted with the
+   * corresponding classes.
    *
    * The interceptors are filtered to avoid emitting trivial interceptors.  For
    * example, if the program contains no code that can distinguish between the
@@ -57,117 +57,117 @@ class NativeEmitter {
    * improves performance when more classes can be treated as leaves.
    *
    * [classes] contains native classes, mixin applications, and user subclasses
-   * of native classes.  ONLY the native classes are generated here.  [classes]
-   * is sorted in desired output order.
+   * of native classes.
    *
-   * [additionalProperties] is used to collect properties that are pushed up
-   * from the above optimizations onto a non-native class, e.g, `Interceptor`.
+   * [interceptorClassesNeededByConstants] contains the interceptors that are
+   * referenced by constants.
+   *
+   * [classesModifiedByEmitRTISupport] contains the list of classes that must
+   * exist, because runtime-type support adds information to the class.
    */
-  void generateNativeClasses(
-      List<ClassElement> classes,
-      Map<ClassElement, Map<String, jsAst.Expression>> additionalProperties) {
+  Set<Class> prepareNativeClasses(
+      List<Class> classes,
+      Set<ClassElement> interceptorClassesNeededByConstants,
+      Set<ClassElement> classesModifiedByEmitRTISupport) {
+    assert(classes.every((Class cls) => cls != null));
+
+    hasNativeClasses = classes.isNotEmpty;
+
     // Compute a pre-order traversal of the subclass forest.  We actually want a
     // post-order traversal but it is easier to compute the pre-order and use it
     // in reverse.
+    List<Class> preOrder = <Class>[];
+    Set<Class> seen = new Set<Class>();
 
-    List<ClassElement> preOrder = <ClassElement>[];
-    Set<ClassElement> seen = new Set<ClassElement>();
-    seen..add(compiler.objectClass)
-        ..add(backend.jsInterceptorClass);
-    void walk(ClassElement element) {
-      if (seen.contains(element)) return;
-      seen.add(element);
-      walk(element.superclass);
-      preOrder.add(element);
+    Class objectClass = null;
+    Class jsInterceptorClass = null;
+
+    void walk(Class cls) {
+      if (cls.element == compiler.coreClasses.objectClass) {
+        objectClass = cls;
+        return;
+      }
+      if (cls.element == helpers.jsInterceptorClass) {
+        jsInterceptorClass = cls;
+        return;
+      }
+      if (seen.contains(cls)) return;
+      seen.add(cls);
+      walk(cls.superclass);
+      preOrder.add(cls);
     }
     classes.forEach(walk);
-
-    // Generate code for each native class into [ClassBuilder]s.
-
-    Map<ClassElement, ClassBuilder> builders =
-        new Map<ClassElement, ClassBuilder>();
-    for (ClassElement classElement in classes) {
-      if (classElement.isNative) {
-        ClassBuilder builder = generateNativeClass(classElement);
-        builders[classElement] = builder;
-      }
-    }
 
     // Find which classes are needed and which are non-leaf classes.  Any class
     // that is not needed can be treated as a leaf class equivalent to some
     // needed class.
 
-    Set<ClassElement> neededClasses = new Set<ClassElement>();
-    Set<ClassElement> nonleafClasses = new Set<ClassElement>();
+    Set<Class> neededClasses = new Set<Class>();
+    Set<Class> nonLeafClasses = new Set<Class>();
 
-    Map<ClassElement, List<ClassElement>> extensionPoints =
-        computeExtensionPoints(preOrder);
+    Map<Class, List<Class>> extensionPoints = computeExtensionPoints(preOrder);
 
-    neededClasses.add(compiler.objectClass);
+    neededClasses.add(objectClass);
 
-    Set<ClassElement> neededByConstant =
-        emitterTask.interceptorsReferencedFromConstants();
-    Set<ClassElement> modifiedClasses =
-        emitterTask.typeTestRegistry.classesModifiedByEmitRuntimeTypeSupport();
-
-    for (ClassElement classElement in preOrder.reversed) {
+    for (Class cls in preOrder.reversed) {
+      ClassElement classElement = cls.element;
       // Post-order traversal ensures we visit the subclasses before their
       // superclass.  This makes it easy to tell if a class is needed because a
       // subclass is needed.
-      ClassBuilder builder = builders[classElement];
       bool needed = false;
-      if (builder == null) {
+      if (!cls.isNative) {
         // Mixin applications (native+mixin) are non-native, so [classElement]
         // has already been emitted as a regular class.  Mark [classElement] as
         // 'needed' to ensure the native superclass is needed.
         needed = true;
-      } else if (!builder.isTrivial) {
+      } else if (!isTrivialClass(cls)) {
         needed = true;
-      } else if (neededByConstant.contains(classElement)) {
+      } else if (interceptorClassesNeededByConstants.contains(classElement)) {
         needed = true;
-      } else if (modifiedClasses.contains(classElement)) {
+      } else if (classesModifiedByEmitRTISupport.contains(classElement)) {
         // TODO(9556): Remove this test when [emitRuntimeTypeSupport] no longer
         // adds information to a class prototype or constructor.
         needed = true;
-      } else if (extensionPoints.containsKey(classElement)) {
+      } else if (extensionPoints.containsKey(cls)) {
         needed = true;
       }
-      if (classElement.isNative &&
-          native.nativeTagsForcedNonLeaf(classElement)) {
+      if (backend.isJsInterop(classElement)) {
+        needed = true; // TODO(jacobr): we don't need all interop classes.
+      } else if (cls.isNative &&
+          backend.nativeData.hasNativeTagsForcedNonLeaf(classElement)) {
         needed = true;
-        nonleafClasses.add(classElement);
+        nonLeafClasses.add(cls);
       }
 
-      if (needed || neededClasses.contains(classElement)) {
-        neededClasses.add(classElement);
-        neededClasses.add(classElement.superclass);
-        nonleafClasses.add(classElement.superclass);
+      if (needed || neededClasses.contains(cls)) {
+        neededClasses.add(cls);
+        neededClasses.add(cls.superclass);
+        nonLeafClasses.add(cls.superclass);
       }
     }
 
     // Collect all the tags that map to each native class.
 
-    Map<ClassElement, Set<String>> leafTags =
-        new Map<ClassElement, Set<String>>();
-    Map<ClassElement, Set<String>> nonleafTags =
-        new Map<ClassElement, Set<String>>();
+    Map<Class, Set<String>> leafTags = new Map<Class, Set<String>>();
+    Map<Class, Set<String>> nonleafTags = new Map<Class, Set<String>>();
 
-    for (ClassElement classElement in classes) {
-      if (!classElement.isNative) continue;
-      List<String> nativeTags = native.nativeTagsOfClass(classElement);
+    for (Class cls in classes) {
+      if (!cls.isNative) continue;
+      if (backend.isJsInterop(cls.element)) continue;
+      List<String> nativeTags =
+          backend.nativeData.getNativeTagsOfClass(cls.element);
 
-      if (nonleafClasses.contains(classElement) ||
-          extensionPoints.containsKey(classElement)) {
+      if (nonLeafClasses.contains(cls) || extensionPoints.containsKey(cls)) {
         nonleafTags
-            .putIfAbsent(classElement, () => new Set<String>())
+            .putIfAbsent(cls, () => new Set<String>())
             .addAll(nativeTags);
       } else {
-        ClassElement sufficingInterceptor = classElement;
+        Class sufficingInterceptor = cls;
         while (!neededClasses.contains(sufficingInterceptor)) {
           sufficingInterceptor = sufficingInterceptor.superclass;
         }
-        if (sufficingInterceptor == compiler.objectClass) {
-          sufficingInterceptor = backend.jsInterceptorClass;
+        if (sufficingInterceptor == objectClass) {
+          sufficingInterceptor = jsInterceptorClass;
         }
         leafTags
             .putIfAbsent(sufficingInterceptor, () => new Set<String>())
@@ -175,71 +175,38 @@ class NativeEmitter {
       }
     }
 
+    void fillNativeInfo(Class cls) {
+      assert(cls.nativeLeafTags == null &&
+          cls.nativeNonLeafTags == null &&
+          cls.nativeExtensions == null);
+      if (leafTags[cls] != null) {
+        cls.nativeLeafTags = leafTags[cls].toList(growable: false);
+      }
+      if (nonleafTags[cls] != null) {
+        cls.nativeNonLeafTags = nonleafTags[cls].toList(growable: false);
+      }
+      cls.nativeExtensions = extensionPoints[cls];
+    }
     // Add properties containing the information needed to construct maps used
     // by getNativeInterceptor and custom elements.
     if (compiler.enqueuer.codegen.nativeEnqueuer
         .hasInstantiatedNativeClasses()) {
-      void generateClassInfo(ClassElement classElement) {
-        // Property has the form:
-        //
-        //    "%": "leafTag1|leafTag2|...;nonleafTag1|...;Class1|Class2|...",
-        //
-        // If there is no data following a semicolon, the semicolon can be
-        // omitted.
-
-        String formatTags(Iterable<String> tags) {
-          if (tags == null) return '';
-          return (tags.toList()..sort()).join('|');
+      fillNativeInfo(jsInterceptorClass);
+      for (Class cls in classes) {
+        if (!cls.isNative || neededClasses.contains(cls)) {
+          fillNativeInfo(cls);
         }
-
-        List<ClassElement> extensions = extensionPoints[classElement];
-
-        String leafStr = formatTags(leafTags[classElement]);
-        String nonleafStr = formatTags(nonleafTags[classElement]);
-
-        StringBuffer sb = new StringBuffer(leafStr);
-        if (nonleafStr != '') {
-          sb..write(';')..write(nonleafStr);
-        }
-        if (extensions != null) {
-          sb..write(';')
-            ..writeAll(extensions.map(backend.namer.getNameOfClass), '|');
-        }
-        String encoding = sb.toString();
-
-        ClassBuilder builder = builders[classElement];
-        if (builder == null) {
-          // No builder because this is an intermediate mixin application or
-          // Interceptor - these are not direct native classes.
-          if (encoding != '') {
-            Map<String, jsAst.Expression> properties =
-                additionalProperties.putIfAbsent(classElement,
-                    () => new Map<String, jsAst.Expression>());
-            properties[backend.namer.nativeSpecProperty] = js.string(encoding);
-          }
-        } else {
-          builder.addProperty(
-              backend.namer.nativeSpecProperty, js.string(encoding));
-        }
-      }
-      generateClassInfo(backend.jsInterceptorClass);
-      for (ClassElement classElement in classes) {
-        generateClassInfo(classElement);
       }
     }
 
-    // Emit the native class interceptors that were actually used.
-    for (ClassElement classElement in classes) {
-      if (!classElement.isNative) continue;
-      if (neededClasses.contains(classElement)) {
-        // Define interceptor class for [classElement].
-        emitterTask.oldEmitter.classEmitter.emitClassBuilderWithReflectionData(
-            backend.namer.getNameOfClass(classElement),
-            classElement, builders[classElement],
-            emitterTask.oldEmitter.getElementDescriptor(classElement));
-        emitterTask.oldEmitter.needsClassSupport = true;
-      }
-    }
+    // TODO(sra): Issue #13731- this is commented out as part of custom
+    // element constructor work.
+    // (floitsch: was run on every native class.)
+    //assert(!classElement.hasBackendMembers);
+
+    return classes
+        .where((Class cls) => cls.isNative && !neededClasses.contains(cls))
+        .toSet();
   }
 
   /**
@@ -247,92 +214,47 @@ class NativeEmitter {
    * classes and the set non-mative classes that extend them.  (A List is used
    * instead of a Set for out stability).
    */
-  Map<ClassElement, List<ClassElement>> computeExtensionPoints(
-      List<ClassElement> classes) {
-    ClassElement nativeSuperclassOf(ClassElement element) {
-      if (element == null) return null;
-      if (element.isNative) return element;
-      return nativeSuperclassOf(element.superclass);
+  Map<Class, List<Class>> computeExtensionPoints(List<Class> classes) {
+    Class nativeSuperclassOf(Class cls) {
+      if (cls == null) return null;
+      if (cls.isNative) return cls;
+      return nativeSuperclassOf(cls.superclass);
     }
 
-    ClassElement nativeAncestorOf(ClassElement element) {
-      return nativeSuperclassOf(element.superclass);
+    Class nativeAncestorOf(Class cls) {
+      return nativeSuperclassOf(cls.superclass);
     }
 
-    Map<ClassElement, List<ClassElement>> map =
-        new Map<ClassElement, List<ClassElement>>();
+    Map<Class, List<Class>> map = new Map<Class, List<Class>>();
 
-    for (ClassElement classElement in classes) {
-      if (classElement.isNative) continue;
-      ClassElement nativeAncestor = nativeAncestorOf(classElement);
+    for (Class cls in classes) {
+      if (cls.isNative) continue;
+      Class nativeAncestor = nativeAncestorOf(cls);
       if (nativeAncestor != null) {
-        map
-          .putIfAbsent(nativeAncestor, () => <ClassElement>[])
-          .add(classElement);
+        map.putIfAbsent(nativeAncestor, () => <Class>[]).add(cls);
       }
     }
     return map;
   }
 
-  ClassBuilder generateNativeClass(ClassElement classElement) {
-    // TODO(sra): Issue #13731- this is commented out as part of custom element
-    // constructor work.
-    //assert(!classElement.hasBackendMembers);
-    hasNativeClasses = true;
-
-    ClassElement superclass = classElement.superclass;
-    assert(superclass != null);
-    // Fix superclass.  TODO(sra): make native classes inherit from Interceptor.
-    assert(superclass != compiler.objectClass);
-    if (superclass == compiler.objectClass) {
-      superclass = backend.jsInterceptorClass;
+  bool isTrivialClass(Class cls) {
+    bool needsAccessor(Field field) {
+      return field.needsGetter ||
+          field.needsUncheckedSetter ||
+          field.needsCheckedSetter;
     }
 
-    String superName = backend.namer.getNameOfClass(superclass);
-
-    ClassBuilder builder;
-    if (compiler.hasIncrementalSupport) {
-      builder = cachedBuilders[classElement];
-      if (builder != null) return builder;
-      builder = new ClassBuilder(classElement, backend.namer);
-      cachedBuilders[classElement] = builder;
-    } else {
-      builder = new ClassBuilder(classElement, backend.namer);
-    }
-    builder.superName = superName;
-
-    emitterTask.oldEmitter.classEmitter.emitClassConstructor(
-        classElement, builder);
-    bool hasFields = emitterTask.oldEmitter.classEmitter.emitFields(
-        classElement, builder, classIsNative: true);
-    int propertyCount = builder.properties.length;
-    emitterTask.oldEmitter.classEmitter.emitClassGettersSetters(
-        classElement, builder);
-    emitterTask.oldEmitter.classEmitter.emitInstanceMembers(
-        classElement, builder);
-    emitterTask.oldEmitter.typeTestEmitter.emitIsTests(classElement, builder);
-
-    if (!hasFields &&
-        builder.properties.length == propertyCount &&
-        superclass is! MixinApplicationElement) {
-      builder.isTrivial = true;
-    }
-
-    return builder;
+    return cls.methods.isEmpty &&
+        cls.isChecks.isEmpty &&
+        cls.callStubs.isEmpty &&
+        !cls.superclass.isMixinApplication &&
+        !cls.fields.any(needsAccessor);
   }
 
-  void finishGenerateNativeClasses() {
-    // TODO(sra): Put specialized version of getNativeMethods on
-    // `Object.prototype` to avoid checking in `getInterceptor` and
-    // specializations.
-  }
-
-  void potentiallyConvertDartClosuresToJs(
-      List<jsAst.Statement> statements,
-      FunctionElement member,
-      List<jsAst.Parameter> stubParameters) {
+  void potentiallyConvertDartClosuresToJs(List<jsAst.Statement> statements,
+      FunctionElement member, List<jsAst.Parameter> stubParameters) {
     FunctionSignature parameters = member.functionSignature;
-    Element converter = backend.findHelper('convertDartClosureToJS');
+    Element converter = helpers.closureConverter;
     jsAst.Expression closureConverter =
         emitterTask.staticFunctionAccess(converter);
     parameters.forEachParameter((ParameterElement parameter) {
@@ -341,15 +263,14 @@ class NativeEmitter {
       // parameter that was not provided for this stub.
       for (jsAst.Parameter stubParameter in stubParameters) {
         if (stubParameter.name == name) {
-          DartType type = parameter.type.unalias(compiler);
+          DartType type = parameter.type.unaliased;
           if (type is FunctionType) {
             // The parameter type is a function type either directly or through
             // typedef(s).
             FunctionType functionType = type;
             int arity = functionType.computeArity();
-            statements.add(
-                js.statement('# = #(#, $arity)',
-                    [name, closureConverter, name]));
+            statements.add(js
+                .statement('# = #(#, $arity)', [name, closureConverter, name]));
             break;
           }
         }
@@ -360,20 +281,18 @@ class NativeEmitter {
   List<jsAst.Statement> generateParameterStubStatements(
       FunctionElement member,
       bool isInterceptedMethod,
-      String invocationName,
+      jsAst.Name invocationName,
       List<jsAst.Parameter> stubParameters,
       List<jsAst.Expression> argumentsBuffer,
       int indexOfLastOptionalArgumentInParameters) {
     // The target JS function may check arguments.length so we need to
     // make sure not to pass any unspecified optional arguments to it.
     // For example, for the following Dart method:
-    //   foo([x, y, z]);
+    //   foo({x, y, z});
     // The call:
     //   foo(y: 1)
     // must be turned into a JS call to:
     //   foo(null, y).
-
-    ClassElement classElement = member.enclosingClass;
 
     List<jsAst.Statement> statements = <jsAst.Statement>[];
     potentiallyConvertDartClosuresToJs(statements, member, stubParameters);
@@ -385,39 +304,38 @@ class NativeEmitter {
     assert(invariant(member, nativeMethods.contains(member)));
     // When calling a JS method, we call it with the native name, and only the
     // arguments up until the last one provided.
-    target = member.fixedBackendName;
+    target = backend.nativeData.getFixedBackendName(member);
 
     if (isInterceptedMethod) {
       receiver = argumentsBuffer[0];
-      arguments = argumentsBuffer.sublist(1,
-          indexOfLastOptionalArgumentInParameters + 1);
+      arguments = argumentsBuffer.sublist(
+          1, indexOfLastOptionalArgumentInParameters + 1);
     } else {
-      receiver = js('this');
-      arguments = argumentsBuffer.sublist(0,
-          indexOfLastOptionalArgumentInParameters + 1);
+      // Native methods that are not intercepted must be static.
+      assert(invariant(member, member.isStatic));
+      arguments = argumentsBuffer.sublist(
+          0, indexOfLastOptionalArgumentInParameters + 1);
+      if (backend.isJsInterop(member)) {
+        // fixedBackendPath is allowed to have the form foo.bar.baz for
+        // interop. This template is uncached to avoid possibly running out of
+        // memory when Dart2Js is run in server mode. In reality the risk of
+        // caching these templates causing an issue  is very low as each class
+        // and library that uses typed JavaScript interop will create only 1
+        // unique template.
+        receiver = js
+            .uncachedExpressionTemplate(backend.namer.fixedBackendPath(member))
+            .instantiate([]);
+      } else {
+        receiver = js('this');
+      }
     }
-    statements.add(
-        js.statement('return #.#(#)', [receiver, target, arguments]));
+    statements
+        .add(js.statement('return #.#(#)', [receiver, target, arguments]));
 
     return statements;
   }
 
-  bool isSupertypeOfNativeClass(Element element) {
-    if (element.isTypeVariable) {
-      compiler.internalError(element, "Is check for type variable.");
-      return false;
-    }
-    if (element.computeType(compiler).unalias(compiler) is FunctionType) {
-      // The element type is a function type either directly or through
-      // typedef(s).
-      return false;
-    }
-
-    if (!element.isClass) {
-      compiler.internalError(element, "Is check does not handle element.");
-      return false;
-    }
-
+  bool isSupertypeOfNativeClass(ClassElement element) {
     if (backend.classesMixedIntoInterceptedClasses.contains(element)) {
       return true;
     }
@@ -434,46 +352,7 @@ class NativeEmitter {
     // is whether the receiver can be native, not the type of the test.
     if (element == null || !element.isClass) return false;
     ClassElement cls = element;
-    if (Elements.isNativeOrExtendsNative(cls)) return true;
+    if (backend.isNativeOrExtendsNative(cls)) return true;
     return isSupertypeOfNativeClass(element);
-  }
-
-  void assembleCode(CodeOutput targetOutput) {
-    List<jsAst.Property> objectProperties = <jsAst.Property>[];
-
-    jsAst.Property addProperty(String name, jsAst.Expression value) {
-      jsAst.Property prop = new jsAst.Property(js.string(name), value);
-      objectProperties.add(prop);
-      return prop;
-    }
-
-    if (hasNativeClasses) {
-      // If the native emitter has been asked to take care of the
-      // noSuchMethod handlers, we do that now.
-      if (handleNoSuchMethod) {
-        emitterTask.oldEmitter.nsmEmitter.emitNoSuchMethodHandlers(addProperty);
-      }
-    }
-
-    // If we have any properties to add to Object.prototype, we run
-    // through them and add them using defineProperty.
-    if (!objectProperties.isEmpty) {
-      jsAst.Expression init = js(r'''
-          (function(table) {
-            for(var key in table)
-              #(Object.prototype, key, table[key]);
-           })(#)''',
-          [ defPropFunction,
-            new jsAst.ObjectInitializer(objectProperties)]);
-
-      if (emitterTask.compiler.enableMinification) {
-        targetOutput.add(';');
-      }
-      targetOutput.addBuffer(jsAst.prettyPrint(
-          new jsAst.ExpressionStatement(init), compiler));
-      targetOutput.add('\n');
-    }
-
-    targetOutput.add('\n');
   }
 }

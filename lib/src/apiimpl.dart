@@ -5,204 +5,75 @@
 library leg_apiimpl;
 
 import 'dart:async';
+import 'dart:convert';
 
-import '../compiler.dart' as api;
-import 'dart2jslib.dart' as leg;
-import 'tree/tree.dart' as tree;
+import 'package:package_config/packages.dart';
+import 'package:package_config/packages_file.dart' as pkgs;
+import 'package:package_config/src/packages_impl.dart'
+    show MapPackages, NonFilePackagesDirectoryPackages;
+import 'package:package_config/src/util.dart' show checkValidPackageUri;
+
+import '../compiler_new.dart' as api;
+import 'common/tasks.dart' show GenericTask;
+import 'common.dart';
+import 'compiler.dart';
+import 'diagnostics/messages.dart' show Message;
 import 'elements/elements.dart' as elements;
-import 'package:_internal/libraries.dart' hide LIBRARIES;
-import 'package:_internal/libraries.dart' as library_info show LIBRARIES;
+import 'environment.dart';
 import 'io/source_file.dart';
+import 'options.dart' show CompilerOptions;
+import 'platform_configuration.dart' as platform_configuration;
+import 'resolved_uri_translator.dart';
+import 'script.dart';
 
-const bool forceIncrementalSupport =
-    const bool.fromEnvironment('DART2JS_EXPERIMENTAL_INCREMENTAL_SUPPORT');
+/// Implements the [Compiler] using a [api.CompilerInput] for supplying the
+/// sources.
+class CompilerImpl extends Compiler {
+  api.CompilerInput provider;
+  api.CompilerDiagnostics handler;
+  Packages packages;
 
-class Compiler extends leg.Compiler {
-  api.CompilerInputProvider provider;
-  api.DiagnosticHandler handler;
-  final Uri libraryRoot;
-  final Uri packageRoot;
-  List<String> options;
-  Map<String, dynamic> environment;
-  bool mockableLibraryUsed = false;
-  final Set<String> allowedLibraryCategories;
+  bool get mockableLibraryUsed => resolvedUriTranslator.isSet
+      ? resolvedUriTranslator.mockableLibraryUsed
+      : false;
 
-  leg.GenericTask userHandlerTask;
-  leg.GenericTask userProviderTask;
+  ForwardingResolvedUriTranslator resolvedUriTranslator;
 
-  Compiler(this.provider,
-           api.CompilerOutputProvider outputProvider,
-           this.handler,
-           this.libraryRoot,
-           this.packageRoot,
-           List<String> options,
-           this.environment)
-      : this.options = options,
-        this.allowedLibraryCategories = getAllowedLibraryCategories(options),
+  GenericTask userHandlerTask;
+  GenericTask userProviderTask;
+  GenericTask userPackagesDiscoveryTask;
+
+  Uri get libraryRoot => options.platformConfigUri.resolve(".");
+
+  CompilerImpl(this.provider, api.CompilerOutput outputProvider, this.handler,
+      CompilerOptions options)
+      : resolvedUriTranslator = new ForwardingResolvedUriTranslator(),
         super(
+            options: options,
             outputProvider: outputProvider,
-            enableTypeAssertions: hasOption(options, '--enable-checked-mode'),
-            enableUserAssertions: hasOption(options, '--enable-checked-mode'),
-            trustTypeAnnotations:
-                hasOption(options, '--trust-type-annotations'),
-            trustPrimitives:
-                hasOption(options, '--trust-primitives'),
-            enableMinification: hasOption(options, '--minify'),
-            preserveUris: hasOption(options, '--preserve-uris'),
-            enableNativeLiveTypeAnalysis:
-                !hasOption(options, '--disable-native-live-type-analysis'),
-            emitJavaScript: !(hasOption(options, '--output-type=dart') ||
-                              hasOption(options, '--output-type=dart-multi')),
-            dart2dartMultiFile: hasOption(options, '--output-type=dart-multi'),
-            generateSourceMap: !hasOption(options, '--no-source-maps'),
-            analyzeAllFlag: hasOption(options, '--analyze-all'),
-            analyzeOnly: hasOption(options, '--analyze-only'),
-            analyzeMain: hasOption(options, '--analyze-main'),
-            analyzeSignaturesOnly:
-                hasOption(options, '--analyze-signatures-only'),
-            strips: extractCsvOption(options, '--force-strip='),
-            enableConcreteTypeInference:
-                hasOption(options, '--enable-concrete-type-inference'),
-            disableTypeInferenceFlag:
-                hasOption(options, '--disable-type-inference'),
-            preserveComments: hasOption(options, '--preserve-comments'),
-            verbose: hasOption(options, '--verbose'),
-            sourceMapUri: extractUriOption(options, '--source-map='),
-            outputUri: extractUriOption(options, '--out='),
-            terseDiagnostics: hasOption(options, '--terse'),
-            deferredMapUri: extractUriOption(options, '--deferred-map='),
-            dumpInfo: hasOption(options, '--dump-info'),
-            buildId: extractStringOption(
-                options, '--build-id=',
-                "build number could not be determined"),
-            showPackageWarnings:
-                hasOption(options, '--show-package-warnings'),
-            useContentSecurityPolicy: hasOption(options, '--csp'),
-            hasIncrementalSupport:
-                forceIncrementalSupport ||
-                hasOption(options, '--incremental-support'),
-            suppressWarnings: hasOption(options, '--suppress-warnings'),
-            enableExperimentalMirrors:
-                hasOption(options, '--enable-experimental-mirrors'),
-            enableAsyncAwait: hasOption(options, '--enable-async'),
-            enableEnums: hasOption(options, '--enable-enum'),
-            generateCodeWithCompileTimeErrors:
-                hasOption(options, '--generate-code-with-compile-time-errors'),
-            allowNativeExtensions:
-                hasOption(options, '--allow-native-extensions')) {
+            environment: new _Environment(options.environment)) {
+    _Environment env = environment;
+    env.compiler = this;
     tasks.addAll([
-        userHandlerTask = new leg.GenericTask('Diagnostic handler', this),
-        userProviderTask = new leg.GenericTask('Input provider', this),
+      userHandlerTask = new GenericTask('Diagnostic handler', this),
+      userProviderTask = new GenericTask('Input provider', this),
+      userPackagesDiscoveryTask = new GenericTask('Package discovery', this),
     ]);
-    if (libraryRoot == null) {
-      throw new ArgumentError("[libraryRoot] is null.");
-    }
-    if (!libraryRoot.path.endsWith("/")) {
-      throw new ArgumentError("[libraryRoot] must end with a /.");
-    }
-    if (packageRoot == null) {
-      throw new ArgumentError("[packageRoot] is null.");
-    }
-    if (!packageRoot.path.endsWith("/")) {
-      throw new ArgumentError("[packageRoot] must end with a /.");
-    }
-    if (!analyzeOnly) {
-      if (enableAsyncAwait) {
-        throw new ArgumentError(
-            "--enable-async is currently only supported with --analyze-only");
-      }
-      if (allowNativeExtensions) {
-        throw new ArgumentError(
-            "--allow-native-extensions is only supported in combination with "
-            "--analyze-only");
-      }
-    }
-  }
-
-  static String extractStringOption(List<String> options,
-                                    String prefix,
-                                    String defaultValue) {
-    for (String option in options) {
-      if (option.startsWith(prefix)) {
-        return option.substring(prefix.length);
-      }
-    }
-    return defaultValue;
-  }
-
-  static Uri extractUriOption(List<String> options, String prefix) {
-    var option = extractStringOption(options, prefix, null);
-    return (option == null) ? null : Uri.parse(option);
-  }
-
-  // CSV: Comma separated values.
-  static List<String> extractCsvOption(List<String> options, String prefix) {
-    for (String option in options) {
-      if (option.startsWith(prefix)) {
-        return option.substring(prefix.length).split(',');
-      }
-    }
-    return const <String>[];
-  }
-
-  static Set<String> getAllowedLibraryCategories(List<String> options) {
-    var result = extractCsvOption(options, '--categories=');
-    if (result.isEmpty) {
-      result = ['Client'];
-    }
-    result.add('Shared');
-    result.add('Internal');
-    return new Set<String>.from(result);
-  }
-
-  static bool hasOption(List<String> options, String option) {
-    return options.indexOf(option) >= 0;
-  }
-
-  // TODO(johnniwinther): Merge better with [translateDartUri] when
-  // [scanBuiltinLibrary] is removed.
-  String lookupLibraryPath(String dartLibraryName) {
-    LibraryInfo info = lookupLibraryInfo(dartLibraryName);
-    if (info == null) return null;
-    if (!info.isDart2jsLibrary) return null;
-    if (!allowedLibraryCategories.contains(info.category)) return null;
-    String path = info.dart2jsPath;
-    if (path == null) {
-      path = info.path;
-    }
-    return "lib/$path";
-  }
-
-  String lookupPatchPath(String dartLibraryName) {
-    LibraryInfo info = lookupLibraryInfo(dartLibraryName);
-    if (info == null) return null;
-    if (!info.isDart2jsLibrary) return null;
-    String path = info.dart2jsPatchPath;
-    if (path == null) return null;
-    return "lib/$path";
   }
 
   void log(message) {
-    handler(null, null, null, message, api.Diagnostic.VERBOSE_INFO);
-  }
-
-  /// See [leg.Compiler.translateResolvedUri].
-  Uri translateResolvedUri(elements.LibraryElement importingLibrary,
-                           Uri resolvedUri, tree.Node node) {
-    if (resolvedUri.scheme == 'dart') {
-      return translateDartUri(importingLibrary, resolvedUri, node);
-    }
-    return resolvedUri;
+    callUserHandler(
+        null, null, null, null, message, api.Diagnostic.VERBOSE_INFO);
   }
 
   /**
    * Reads the script designated by [readableUri].
    */
-  Future<leg.Script> readScript(leg.Spannable node, Uri readableUri) {
+  Future<Script> readScript(Uri readableUri, [Spannable node]) {
     if (!readableUri.isAbsolute) {
-      if (node == null) node = leg.NO_LOCATION_SPANNABLE;
-      internalError(node,
-          'Relative uri $readableUri provided to readScript(Uri).');
+      if (node == null) node = NO_LOCATION_SPANNABLE;
+      reporter.internalError(
+          node, 'Relative uri $readableUri provided to readScript(Uri).');
     }
 
     // We need to store the current element since we are reporting read errors
@@ -211,29 +82,27 @@ class Compiler extends leg.Compiler {
     elements.Element element = currentElement;
     void reportReadError(exception) {
       if (element == null || node == null) {
-        reportError(
-            new leg.SourceSpan(readableUri, 0, 0),
-            leg.MessageKind.READ_SELF_ERROR,
+        reporter.reportErrorMessage(
+            new SourceSpan(readableUri, 0, 0),
+            MessageKind.READ_SELF_ERROR,
             {'uri': readableUri, 'exception': exception});
       } else {
-        withCurrentElement(element, () {
-          reportError(
-              node,
-              leg.MessageKind.READ_SCRIPT_ERROR,
+        reporter.withCurrentElement(element, () {
+          reporter.reportErrorMessage(node, MessageKind.READ_SCRIPT_ERROR,
               {'uri': readableUri, 'exception': exception});
         });
       }
     }
 
     Uri resourceUri = translateUri(node, readableUri);
-    String resourceUriString = '$resourceUri';
+    if (resourceUri == null) return _synthesizeScript(readableUri);
     if (resourceUri.scheme == 'dart-ext') {
-      if (!allowNativeExtensions) {
-        withCurrentElement(element, () {
-          reportError(node, leg.MessageKind.DART_EXT_NOT_SUPPORTED);
+      if (!options.allowNativeExtensions) {
+        reporter.withCurrentElement(element, () {
+          reporter.reportErrorMessage(node, MessageKind.DART_EXT_NOT_SUPPORTED);
         });
       }
-      return synthesizeScript(node, readableUri);
+      return _synthesizeScript(readableUri);
     }
 
     // TODO(johnniwinther): Wrap the result from [provider] in a specialized
@@ -242,34 +111,27 @@ class Compiler extends leg.Compiler {
     return new Future.sync(() => callUserProvider(resourceUri)).then((data) {
       SourceFile sourceFile;
       if (data is List<int>) {
-        sourceFile = new Utf8BytesSourceFile(resourceUriString, data);
+        sourceFile = new Utf8BytesSourceFile(resourceUri, data);
       } else if (data is String) {
-        sourceFile = new StringSourceFile(resourceUriString, data);
+        sourceFile = new StringSourceFile.fromUri(resourceUri, data);
       } else {
         String message = "Expected a 'String' or a 'List<int>' from the input "
-                         "provider, but got: ${Error.safeToString(data)}.";
+            "provider, but got: ${Error.safeToString(data)}.";
         reportReadError(message);
       }
       // We use [readableUri] as the URI for the script since need to preserve
       // the scheme in the script because [Script.uri] is used for resolving
       // relative URIs mentioned in the script. See the comment on
       // [LibraryLoader] for more details.
-      return new leg.Script(readableUri, resourceUri, sourceFile);
+      return new Script(readableUri, resourceUri, sourceFile);
     }).catchError((error) {
       reportReadError(error);
-      return synthesizeScript(node, readableUri);
+      return _synthesizeScript(readableUri);
     });
   }
 
-  Future<leg.Script> synthesizeScript(leg.Spannable node, Uri readableUri) {
-    Uri resourceUri = translateUri(node, readableUri);
-    return new Future.value(
-        new leg.Script(
-            readableUri, resourceUri,
-            new StringSourceFile(
-                '$resourceUri',
-                "// Synthetic source file generated for '$readableUri'."),
-            isSynthesized: true));
+  Future<Script> _synthesizeScript(Uri readableUri) {
+    return new Future.value(new Script.synthetic(readableUri));
   }
 
   /**
@@ -277,139 +139,205 @@ class Compiler extends leg.Compiler {
    *
    * See [LibraryLoader] for terminology on URIs.
    */
-  Uri translateUri(leg.Spannable node, Uri readableUri) {
-    switch (readableUri.scheme) {
-      case 'package': return translatePackageUri(node, readableUri);
-      default: return readableUri;
-    }
-  }
+  Uri translateUri(Spannable node, Uri uri) =>
+      uri.scheme == 'package' ? translatePackageUri(node, uri) : uri;
 
-  Uri translateDartUri(elements.LibraryElement importingLibrary,
-                       Uri resolvedUri, tree.Node node) {
-    LibraryInfo libraryInfo = lookupLibraryInfo(resolvedUri.path);
-    String path = lookupLibraryPath(resolvedUri.path);
-    if (libraryInfo != null &&
-        libraryInfo.category == "Internal") {
-      bool allowInternalLibraryAccess = false;
-      if (importingLibrary != null) {
-        if (importingLibrary.isPlatformLibrary || importingLibrary.isPatch) {
-          allowInternalLibraryAccess = true;
-        } else if (importingLibrary.canonicalUri.path.contains(
-                       'dart/tests/compiler/dart2js_native')) {
-          allowInternalLibraryAccess = true;
-        }
-      }
-      if (!allowInternalLibraryAccess) {
-        if (importingLibrary != null) {
-          reportError(
-              node,
-              leg.MessageKind.INTERNAL_LIBRARY_FROM,
-              {'resolvedUri': resolvedUri,
-               'importingUri': importingLibrary.canonicalUri});
-        } else {
-          reportError(
-              node,
-              leg.MessageKind.INTERNAL_LIBRARY,
-              {'resolvedUri': resolvedUri});
-        }
-      }
-    }
-    if (path == null) {
-      reportError(node, leg.MessageKind.LIBRARY_NOT_FOUND,
-                  {'resolvedUri': resolvedUri});
+  Uri translatePackageUri(Spannable node, Uri uri) {
+    try {
+      checkValidPackageUri(uri);
+    } on ArgumentError catch (e) {
+      reporter.reportErrorMessage(node, MessageKind.INVALID_PACKAGE_URI,
+          {'uri': uri, 'exception': e.message});
       return null;
     }
-    if (resolvedUri.path == 'html' ||
-        resolvedUri.path == 'io') {
-      // TODO(ahe): Get rid of mockableLibraryUsed when test.dart
-      // supports this use case better.
-      mockableLibraryUsed = true;
-    }
-    return libraryRoot.resolve(path);
-  }
-
-  Uri resolvePatchUri(String dartLibraryPath) {
-    String patchPath = lookupPatchPath(dartLibraryPath);
-    if (patchPath == null) return null;
-    return libraryRoot.resolve(patchPath);
-  }
-
-  Uri translatePackageUri(leg.Spannable node, Uri uri) {
-    return packageRoot.resolve(uri.path);
-  }
-
-  Future<bool> run(Uri uri) {
-    log('Allowed library categories: $allowedLibraryCategories');
-    return super.run(uri).then((bool success) {
-      int cumulated = 0;
-      for (final task in tasks) {
-        int elapsed = task.timing;
-        if (elapsed != 0) {
-          cumulated += elapsed;
-          log('${task.name} took ${elapsed}msec');
-        }
-      }
-      int total = totalCompileTime.elapsedMilliseconds;
-      log('Total compile-time ${total}msec;'
-          ' unaccounted ${total - cumulated}msec');
-      return success;
+    return packages.resolve(uri, notFound: (Uri notFound) {
+      reporter.reportErrorMessage(
+          node, MessageKind.LIBRARY_NOT_FOUND, {'resolvedUri': uri});
+      return null;
     });
   }
 
-  void reportDiagnostic(leg.Spannable node,
-                        leg.Message message,
-                        api.Diagnostic kind) {
-    leg.SourceSpan span = spanFromSpannable(node);
-    if (identical(kind, api.Diagnostic.ERROR)
-        || identical(kind, api.Diagnostic.CRASH)) {
-      compilationFailed = true;
+  Future<elements.LibraryElement> analyzeUri(Uri uri,
+      {bool skipLibraryWithPartOfTag: true}) {
+    List<Future> setupFutures = new List<Future>();
+    if (resolvedUriTranslator.isNotSet) {
+      setupFutures.add(setupSdk());
     }
+    if (packages == null) {
+      setupFutures.add(setupPackages(uri));
+    }
+    return Future.wait(setupFutures).then((_) {
+      return super
+          .analyzeUri(uri, skipLibraryWithPartOfTag: skipLibraryWithPartOfTag);
+    });
+  }
+
+  Future setupPackages(Uri uri) {
+    if (options.packageRoot != null) {
+      // Use "non-file" packages because the file version requires a [Directory]
+      // and we can't depend on 'dart:io' classes.
+      packages = new NonFilePackagesDirectoryPackages(options.packageRoot);
+    } else if (options.packageConfig != null) {
+      return callUserProvider(options.packageConfig).then((configContents) {
+        if (configContents is String) {
+          configContents = UTF8.encode(configContents);
+        }
+        // The input provider may put a trailing 0 byte when it reads a source
+        // file, which confuses the package config parser.
+        if (configContents.length > 0 && configContents.last == 0) {
+          configContents = configContents.sublist(0, configContents.length - 1);
+        }
+        packages =
+            new MapPackages(pkgs.parse(configContents, options.packageConfig));
+      }).catchError((error) {
+        reporter.reportErrorMessage(
+            NO_LOCATION_SPANNABLE,
+            MessageKind.INVALID_PACKAGE_CONFIG,
+            {'uri': options.packageConfig, 'exception': error});
+        packages = Packages.noPackages;
+      });
+    } else {
+      if (options.packagesDiscoveryProvider == null) {
+        packages = Packages.noPackages;
+      } else {
+        return callUserPackagesDiscovery(uri).then((p) {
+          packages = p;
+        });
+      }
+    }
+    return new Future.value();
+  }
+
+  Future<Null> setupSdk() {
+    if (resolvedUriTranslator.isNotSet) {
+      return platform_configuration
+          .load(options.platformConfigUri, provider)
+          .then((Map<String, Uri> mapping) {
+        resolvedUriTranslator.resolvedUriTranslator =
+            new ResolvedUriTranslator(mapping, reporter);
+      });
+    } else {
+      // The incremental compiler sets up the sdk before run.
+      // Therefore this will be called a second time.
+      return new Future.value(null);
+    }
+  }
+
+  Future<bool> run(Uri uri) {
+    log('Using platform configuration at ${options.platformConfigUri}');
+
+    return Future.wait([setupSdk(), setupPackages(uri)]).then((_) {
+      assert(resolvedUriTranslator.isSet);
+      assert(packages != null);
+
+      return super.run(uri).then((bool success) {
+        int cumulated = 0;
+        for (final task in tasks) {
+          int elapsed = task.timing;
+          if (elapsed != 0) {
+            cumulated += elapsed;
+            log('${task.name} took ${elapsed}msec');
+            for (String subtask in task.subtasks) {
+              int subtime = task.getSubtaskTime(subtask);
+              log('${task.name} > $subtask took ${subtime}msec');
+            }
+          }
+        }
+        int total = totalCompileTime.elapsedMilliseconds;
+        log('Total compile-time ${total}msec;'
+            ' unaccounted ${total - cumulated}msec');
+        return success;
+      });
+    });
+  }
+
+  void reportDiagnostic(DiagnosticMessage message,
+      List<DiagnosticMessage> infos, api.Diagnostic kind) {
+    _reportDiagnosticMessage(message, kind);
+    for (DiagnosticMessage info in infos) {
+      _reportDiagnosticMessage(info, api.Diagnostic.INFO);
+    }
+  }
+
+  void _reportDiagnosticMessage(
+      DiagnosticMessage diagnosticMessage, api.Diagnostic kind) {
     // [:span.uri:] might be [:null:] in case of a [Script] with no [uri]. For
     // instance in the [Types] constructor in typechecker.dart.
+    SourceSpan span = diagnosticMessage.sourceSpan;
+    Message message = diagnosticMessage.message;
     if (span == null || span.uri == null) {
-      callUserHandler(null, null, null, '$message', kind);
+      callUserHandler(message, null, null, null, '$message', kind);
     } else {
       callUserHandler(
-          translateUri(null, span.uri), span.begin, span.end, '$message', kind);
+          message, span.uri, span.begin, span.end, '$message', kind);
     }
   }
 
-  bool get isMockCompilation {
-    return mockableLibraryUsed
-      && (options.indexOf('--allow-mock-compilation') != -1);
-  }
+  bool get isMockCompilation =>
+      mockableLibraryUsed && options.allowMockCompilation;
 
-  void callUserHandler(Uri uri, int begin, int end,
-                       String message, api.Diagnostic kind) {
-    try {
-      userHandlerTask.measure(() {
-        handler(uri, begin, end, message, kind);
-      });
-    } catch (ex, s) {
-      diagnoseCrashInUserCode(
-          'Uncaught exception in diagnostic handler', ex, s);
-      rethrow;
-    }
+  void callUserHandler(Message message, Uri uri, int begin, int end,
+      String text, api.Diagnostic kind) {
+    userHandlerTask.measure(() {
+      handler.report(message, uri, begin, end, text, kind);
+    });
   }
 
   Future callUserProvider(Uri uri) {
-    try {
-      return userProviderTask.measure(() => provider(uri));
-    } catch (ex, s) {
-      diagnoseCrashInUserCode('Uncaught exception in input provider', ex, s);
-      rethrow;
-    }
+    return userProviderTask.measure(() => provider.readFromUri(uri));
   }
 
-  void diagnoseCrashInUserCode(String message, exception, stackTrace) {
-    hasCrashed = true;
-    print('$message: ${tryToString(exception)}');
-    print(tryToString(stackTrace));
+  Future<Packages> callUserPackagesDiscovery(Uri uri) {
+    return userPackagesDiscoveryTask
+        .measure(() => options.packagesDiscoveryProvider(uri));
   }
 
-  fromEnvironment(String name) => environment[name];
-
-  LibraryInfo lookupLibraryInfo(String libraryName) {
-    return library_info.LIBRARIES[libraryName];
+  Uri resolvePatchUri(String libraryName) {
+    return backend.resolvePatchUri(libraryName, options.platformConfigUri);
   }
 }
+
+class _Environment implements Environment {
+  final Map<String, String> definitions;
+
+  // TODO(sigmund): break the circularity here: Compiler needs an environment to
+  // initialize the library loader, but the environment here needs to know about
+  // how the sdk is set up and about whether the backend supports mirrors.
+  CompilerImpl compiler;
+
+  _Environment(this.definitions);
+
+  String valueOf(String name) {
+    assert(invariant(
+        NO_LOCATION_SPANNABLE, compiler.resolvedUriTranslator != null,
+        message: "setupSdk() has not been run"));
+
+    var result = definitions[name];
+    if (result != null || definitions.containsKey(name)) return result;
+    if (!name.startsWith(_dartLibraryEnvironmentPrefix)) return null;
+
+    String libraryName = name.substring(_dartLibraryEnvironmentPrefix.length);
+
+    // Private libraries are not exposed to the users.
+    if (libraryName.startsWith("_")) return null;
+
+    if (compiler.resolvedUriTranslator.sdkLibraries.containsKey(libraryName)) {
+      // Dart2js always "supports" importing 'dart:mirrors' but will abort
+      // the compilation at a later point if the backend doesn't support
+      // mirrors. In this case 'mirrors' should not be in the environment.
+      if (libraryName == 'mirrors') {
+        return compiler.backend.supportsReflection ? "true" : null;
+      }
+      return "true";
+    }
+    return null;
+  }
+}
+
+/// For every 'dart:' library, a corresponding environment variable is set
+/// to "true". The environment variable's name is the concatenation of
+/// this prefix and the name (without the 'dart:'.
+///
+/// For example 'dart:html' has the environment variable 'dart.library.html' set
+/// to "true".
+const String _dartLibraryEnvironmentPrefix = 'dart.library.';

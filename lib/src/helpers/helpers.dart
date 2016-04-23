@@ -7,20 +7,18 @@
 
 library dart2js.helpers;
 
-import 'dart:async' show EventSink;
-import 'dart:collection';
-import 'dart:convert';
-
-import '../../compiler.dart';
-import '../dart2jslib.dart';
+import '../common.dart';
+import '../diagnostics/invariant.dart' show DEBUG_MODE;
 import '../util/util.dart';
 
-part 'debug_collection.dart';
-part 'trace.dart';
-part 'expensive_map.dart';
-part 'expensive_set.dart';
-part 'stats.dart';
-part 'track_map.dart';
+import 'trace.dart';
+
+export 'debug_collection.dart';
+export 'trace.dart';
+export 'expensive_map.dart';
+export 'expensive_set.dart';
+export 'stats.dart';
+export 'track_map.dart';
 
 /// Global flag to enable [debugPrint]. This should always be `true` by default
 /// and be set to `false` as a means to temporarily turn off all debugging
@@ -37,6 +35,7 @@ void enableDebugMode() {
 class _DebugIndentation extends Indentation {
   final String indentationUnit = " ";
 }
+
 _DebugIndentation _indentation = new _DebugIndentation();
 
 /// Function signature of [debugPrint].
@@ -80,7 +79,8 @@ debugBreak() {
 }
 
 /// Function signature of [reportHere].
-typedef ReportHere(Compiler compiler, Spannable node, String debugMessage);
+typedef ReportHere(
+    DiagnosticReporter reporter, Spannable node, String debugMessage);
 
 /// Print a message with a source location.
 ReportHere get reportHere {
@@ -89,7 +89,56 @@ ReportHere get reportHere {
 }
 
 /// Implementation of [reportHere]
-_reportHere(Compiler compiler, Spannable node, String debugMessage) {
-  compiler.reportInfo(node,
-      MessageKind.GENERIC, {'text': 'HERE: $debugMessage'});
+_reportHere(DiagnosticReporter reporter, Spannable node, String debugMessage) {
+  reporter
+      .reportInfo(node, MessageKind.GENERIC, {'text': 'HERE: $debugMessage'});
+}
+
+/// Set of tracked objects used by [track] and [ifTracked].
+var _trackedObjects = new Set();
+
+/// Global default value for the `printTrace` option of [track] and [ifTracked].
+bool trackWithTrace = false;
+
+/// If [doTrack] is `true`, add [object] to the set of tracked objects.
+///
+/// If tracked, [message] is printed along the hash code and toString of
+/// [object]. If [printTrace] is `true` a trace printed additionally.
+/// If [printTrace] is `null`, [trackWithTrace] determines whether a trace is
+/// printed.
+///
+/// [object] is returned as the result of the method.
+track(bool doTrack, Object object, String message, {bool printTrace}) {
+  if (!doTrack) return object;
+  _trackedObjects.add(object);
+  String msg = 'track: ${object.hashCode}:$object:$message';
+  if (printTrace == null) printTrace = trackWithTrace;
+  if (printTrace) {
+    trace(msg);
+  } else {
+    debugPrint(msg);
+  }
+  return object;
+}
+
+/// Returns `true` if [object] is in the set of tracked objects.
+///
+/// If [message] is provided it is printed along the hash code and toString of
+/// [object]. If [printTrace] is `true` a trace printed additionally. If
+/// [printTrace] is `null`, [trackWithTrace] determines whether a trace is
+/// printed.
+bool ifTracked(Object object, {String message, bool printTrace}) {
+  if (_trackedObjects.contains(object)) {
+    if (message != null) {
+      String msg = 'tracked: ${object.hashCode}:$object:$message';
+      if (printTrace == null) printTrace = trackWithTrace;
+      if (printTrace) {
+        trace(msg);
+      } else {
+        debugPrint(msg);
+      }
+    }
+    return true;
+  }
+  return false;
 }

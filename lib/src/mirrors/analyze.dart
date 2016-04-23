@@ -9,8 +9,10 @@ import 'dart:async';
 import 'source_mirrors.dart';
 import 'dart2js_mirrors.dart' show Dart2JsMirrorSystem;
 import '../../compiler.dart' as api;
+import '../options.dart' show CompilerOptions;
 import '../apiimpl.dart' as apiimpl;
-import '../dart2jslib.dart' show Compiler;
+import '../compiler.dart' show Compiler;
+import '../old_to_new_api.dart';
 
 //------------------------------------------------------------------------------
 // Analysis entry point.
@@ -21,12 +23,15 @@ import '../dart2jslib.dart' show Compiler;
  * static inspection of the source code.
  */
 // TODO(johnniwinther): Move this to [compiler/compiler.dart].
-Future<MirrorSystem> analyze(List<Uri> libraries,
-                             Uri libraryRoot,
-                             Uri packageRoot,
-                             api.CompilerInputProvider inputProvider,
-                             api.DiagnosticHandler diagnosticHandler,
-                             [List<String> options = const <String>[]]) {
+Future<MirrorSystem> analyze(
+    List<Uri> libraries,
+    Uri libraryRoot,
+    Uri packageRoot,
+    api.CompilerInputProvider inputProvider,
+    api.DiagnosticHandler diagnosticHandler,
+    [List<String> options = const <String>[],
+    Uri packageConfig,
+    api.PackagesDiscoveryProvider findPackages]) {
   if (!libraryRoot.path.endsWith("/")) {
     throw new ArgumentError("libraryRoot must end with a /");
   }
@@ -42,21 +47,25 @@ Future<MirrorSystem> analyze(List<Uri> libraries,
   options.add('--allow-native-extensions');
 
   bool compilationFailed = false;
-  void internalDiagnosticHandler(Uri uri, int begin, int end,
-                                 String message, api.Diagnostic kind) {
-    if (kind == api.Diagnostic.ERROR ||
-        kind == api.Diagnostic.CRASH) {
+  void internalDiagnosticHandler(
+      Uri uri, int begin, int end, String message, api.Diagnostic kind) {
+    if (kind == api.Diagnostic.ERROR || kind == api.Diagnostic.CRASH) {
       compilationFailed = true;
     }
     diagnosticHandler(uri, begin, end, message, kind);
   }
 
-  Compiler compiler = new apiimpl.Compiler(inputProvider,
-                                           null,
-                                           internalDiagnosticHandler,
-                                           libraryRoot, packageRoot,
-                                           options,
-                                           const {});
+  Compiler compiler = new apiimpl.CompilerImpl(
+      new LegacyCompilerInput(inputProvider),
+      new LegacyCompilerOutput(),
+      new LegacyCompilerDiagnostics(internalDiagnosticHandler),
+      new CompilerOptions.parse(
+          libraryRoot: libraryRoot,
+          packageRoot: packageRoot,
+          options: options,
+          environment: const {},
+          packageConfig: packageConfig,
+          packagesDiscoveryProvider: findPackages));
   compiler.librariesToAnalyzeWhenRun = libraries;
   return compiler.run(null).then((bool success) {
     if (success && !compilationFailed) {

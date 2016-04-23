@@ -4,108 +4,74 @@
 
 library dart2js.js_emitter;
 
-import 'dart:convert';
+import 'package:compiler/js_ast/src/precedence.dart' as js_precedence;
+import 'package:compiler/js_runtime/shared/embedded_names.dart' as embeddedNames;
+import 'package:compiler/js_runtime/shared/embedded_names.dart' show JsBuiltin;
 
+import '../closure.dart'
+    show ClosureClassElement, ClosureClassMap, ClosureFieldElement;
 import '../common.dart';
-
-import '../constants/expressions.dart';
+import '../common/names.dart' show Identifiers;
+import '../common/tasks.dart' show CompilerTask;
+import '../compiler.dart' show Compiler;
 import '../constants/values.dart';
-
-import '../closure.dart' show
-    ClosureClassElement,
-    ClosureClassMap,
-    ClosureFieldElement,
-    CapturedVariable;
-
-import '../dart_types.dart' show
-    TypedefType;
-
-import '../io/code_output.dart';
-
-import '../elements/elements.dart' show
-    ConstructorBodyElement,
-    ElementKind,
-    FieldElement,
-    ParameterElement,
-    TypeVariableElement;
-
-import '../hash/sha1.dart' show Hasher;
-
-import '../helpers/helpers.dart';  // Included for debug helpers.
-
+import '../core_types.dart' show CoreClasses;
+import '../dart_types.dart'
+    show
+        DartType,
+        FunctionType,
+        InterfaceType,
+        TypedefType,
+        Types,
+        TypeVariableType;
+import '../deferred_load.dart' show OutputUnit;
+import '../elements/elements.dart'
+    show
+        ClassElement,
+        ConstructorElement,
+        Element,
+        ElementKind,
+        FieldElement,
+        FunctionElement,
+        FunctionSignature,
+        MetadataAnnotation,
+        MethodElement,
+        MixinApplicationElement,
+        ParameterElement,
+        TypeVariableElement;
 import '../js/js.dart' as jsAst;
-import '../js/js.dart' show
-    js;
-
-import '../js_backend/js_backend.dart' show
-    CheckedModeHelper,
-    ConstantEmitter,
-    CustomElementsAnalysis,
-    JavaScriptBackend,
-    JavaScriptConstantCompiler,
-    Namer,
-    NativeEmitter,
-    RuntimeTypes,
-    Substitution,
-    TypeCheck,
-    TypeChecks,
-    TypeVariableHandler;
-
+import '../js/js.dart' show js;
+import '../js_backend/backend_helpers.dart' show BackendHelpers;
+import '../js_backend/js_backend.dart'
+    show
+        CustomElementsAnalysis,
+        JavaScriptBackend,
+        JavaScriptConstantCompiler,
+        Namer,
+        RuntimeTypes,
+        RuntimeTypesEncoder,
+        Substitution,
+        TypeCheck,
+        TypeChecks,
+        TypeVariableHandler;
+import '../universe/call_structure.dart' show CallStructure;
+import '../universe/selector.dart' show Selector;
+import '../universe/universe.dart' show SelectorConstraints;
+import '../util/util.dart' show Setlet;
+import 'full_emitter/emitter.dart' as full_js_emitter;
+import 'lazy_emitter/emitter.dart' as lazy_js_emitter;
 import 'model.dart';
-import 'program_builder.dart';
+import 'program_builder/program_builder.dart';
+import 'startup_emitter/emitter.dart' as startup_js_emitter;
 
-import 'new_emitter/emitter.dart' as new_js_emitter;
-
-import '../io/line_column_provider.dart' show
-    LineColumnCollector,
-    LineColumnProvider;
-
-import '../io/source_map_builder.dart' show
-    SourceMapBuilder;
-
-import '../util/characters.dart' show
-    $$,
-    $A,
-    $HASH,
-    $PERIOD,
-    $Z,
-    $a,
-    $z;
-
-import '../util/util.dart' show
-    NO_LOCATION_SPANNABLE,
-    Setlet;
-
-import '../util/uri_extras.dart' show
-    relativize;
-
-import '../util/util.dart' show
-    equalElements;
-
-import '../deferred_load.dart' show
-    OutputUnit;
-
-import 'package:_internal/compiler/js_lib/shared/embedded_names.dart'
-    as embeddedNames;
-
-import '../native/native.dart' as native;
 part 'class_stub_generator.dart';
 part 'code_emitter_task.dart';
 part 'helpers.dart';
 part 'interceptor_stub_generator.dart';
+part 'main_call_stub_generator.dart';
+part 'metadata_collector.dart';
 part 'native_emitter.dart';
 part 'native_generator.dart';
-part 'type_test_generator.dart';
+part 'parameter_stub_generator.dart';
+part 'runtime_type_generator.dart';
 part 'type_test_registry.dart';
-
-part 'old_emitter/class_builder.dart';
-part 'old_emitter/class_emitter.dart';
-part 'old_emitter/code_emitter_helper.dart';
-part 'old_emitter/container_builder.dart';
-part 'old_emitter/declarations.dart';
-part 'old_emitter/emitter.dart';
-part 'old_emitter/interceptor_emitter.dart';
-part 'old_emitter/metadata_emitter.dart';
-part 'old_emitter/nsm_emitter.dart';
-part 'old_emitter/reflection_data_parser.dart';
-part 'old_emitter/type_test_emitter.dart';

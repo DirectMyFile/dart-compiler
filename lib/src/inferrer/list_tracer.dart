@@ -2,129 +2,133 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of type_graph_inferrer;
+library compiler.src.inferrer.list_tracer;
+
+import '../elements/elements.dart';
+import '../universe/selector.dart' show Selector;
+import '../util/util.dart' show Setlet;
+
+import 'node_tracer.dart';
+import 'type_graph_nodes.dart';
 
 /**
  * A set of selector names that [List] implements, that we know do not
  * change the element type of the list, or let the list escape to code
  * that might change the element type.
  */
-Set<String> okListSelectorsSet = new Set<String>.from(
-  const <String>[
-    // From Object.
-    '==',
-    'hashCode',
-    'toString',
-    'noSuchMethod',
-    'runtimeType',
+Set<String> okListSelectorsSet = new Set<String>.from(const <String>[
+  // From Object.
+  '==',
+  'hashCode',
+  'toString',
+  'noSuchMethod',
+  'runtimeType',
 
-    // From Iterable.
-    'iterator',
-    'map',
-    'where',
-    'expand',
-    'contains',
-    'forEach',
-    'reduce',
-    'fold',
-    'every',
-    'join',
-    'any',
-    'toList',
-    'toSet',
-    'length',
-    'isEmpty',
-    'isNotEmpty',
-    'take',
-    'takeWhile',
-    'skip',
-    'skipWhile',
-    'first',
-    'last',
-    'single',
-    'firstWhere',
-    'lastWhere',
-    'singleWhere',
-    'elementAt',
+  // From Iterable.
+  'iterator',
+  'map',
+  'where',
+  'expand',
+  'contains',
+  'forEach',
+  'reduce',
+  'fold',
+  'every',
+  'join',
+  'any',
+  'toList',
+  'toSet',
+  'length',
+  'isEmpty',
+  'isNotEmpty',
+  'take',
+  'takeWhile',
+  'skip',
+  'skipWhile',
+  'first',
+  'last',
+  'single',
+  'firstWhere',
+  'lastWhere',
+  'singleWhere',
+  'elementAt',
 
-    // From List.
-    '[]',
-    'length',
-    'reversed',
-    'sort',
-    'indexOf',
-    'lastIndexOf',
-    'clear',
-    'remove',
-    'removeAt',
-    'removeLast',
-    'removeWhere',
-    'retainWhere',
-    'sublist',
-    'getRange',
-    'removeRange',
-    'asMap',
+  // From List.
+  '[]',
+  'length',
+  'reversed',
+  'sort',
+  'indexOf',
+  'lastIndexOf',
+  'clear',
+  'remove',
+  'removeAt',
+  'removeLast',
+  'removeWhere',
+  'retainWhere',
+  'sublist',
+  'getRange',
+  'removeRange',
+  'asMap',
 
-    // From JSArray.
-    'checkMutable',
-    'checkGrowable',
-  ]);
+  // From JSArray.
+  'checkMutable',
+  'checkGrowable',
+]);
 
-Set<String> doNotChangeLengthSelectorsSet = new Set<String>.from(
-  const <String>[
-    // From Object.
-    '==',
-    'hashCode',
-    'toString',
-    'noSuchMethod',
-    'runtimeType',
+Set<String> doNotChangeLengthSelectorsSet = new Set<String>.from(const <String>[
+  // From Object.
+  '==',
+  'hashCode',
+  'toString',
+  'noSuchMethod',
+  'runtimeType',
 
-    // From Iterable.
-    'iterator',
-    'map',
-    'where',
-    'expand',
-    'contains',
-    'forEach',
-    'reduce',
-    'fold',
-    'every',
-    'join',
-    'any',
-    'toList',
-    'toSet',
-    'length',
-    'isEmpty',
-    'isNotEmpty',
-    'take',
-    'takeWhile',
-    'skip',
-    'skipWhile',
-    'first',
-    'last',
-    'single',
-    'firstWhere',
-    'lastWhere',
-    'singleWhere',
-    'elementAt',
+  // From Iterable.
+  'iterator',
+  'map',
+  'where',
+  'expand',
+  'contains',
+  'forEach',
+  'reduce',
+  'fold',
+  'every',
+  'join',
+  'any',
+  'toList',
+  'toSet',
+  'length',
+  'isEmpty',
+  'isNotEmpty',
+  'take',
+  'takeWhile',
+  'skip',
+  'skipWhile',
+  'first',
+  'last',
+  'single',
+  'firstWhere',
+  'lastWhere',
+  'singleWhere',
+  'elementAt',
 
-    // From List.
-    '[]',
-    '[]=',
-    'length',
-    'reversed',
-    'sort',
-    'indexOf',
-    'lastIndexOf',
-    'sublist',
-    'getRange',
-    'asMap',
+  // From List.
+  '[]',
+  '[]=',
+  'length',
+  'reversed',
+  'sort',
+  'indexOf',
+  'lastIndexOf',
+  'sublist',
+  'getRange',
+  'asMap',
 
-    // From JSArray.
-    'checkMutable',
-    'checkGrowable',
-  ]);
-
+  // From JSArray.
+  'checkMutable',
+  'checkGrowable',
+]);
 
 class ListTracerVisitor extends TracerVisitor<ListTypeInformation> {
   // The [Set] of found assignments to the list.
@@ -161,7 +165,7 @@ class ListTracerVisitor extends TracerVisitor<ListTypeInformation> {
   visitStaticCallSiteTypeInformation(StaticCallSiteTypeInformation info) {
     super.visitStaticCallSiteTypeInformation(info);
     Element called = info.calledElement;
-    if (called.isForeign(compiler.backend) && called.name == 'JS') {
+    if (compiler.backend.isForeign(called) && called.name == 'JS') {
       bailout('Used in JS ${info.call}');
     }
   }
@@ -201,7 +205,7 @@ class ListTracerVisitor extends TracerVisitor<ListTypeInformation> {
         assignments.add(inferrer.types.nullType);
       }
     } else if (selector.isCall &&
-               !info.targets.every((element) => element.isFunction)) {
+        !info.targets.every((element) => element.isFunction)) {
       bailout('Passed to a closure');
       return;
     }

@@ -7,16 +7,24 @@ library tree_ir_tracer;
 import 'dart:async' show EventSink;
 import '../tracer.dart';
 import 'tree_ir_nodes.dart';
-import 'optimization/optimization.dart';
 
 class Block {
   Label label;
   int index;
+
   /// Mixed list of [Statement] and [Block].
   /// A [Block] represents a synthetic goto statement.
   final List statements = [];
   final List<Block> predecessors = <Block>[];
   final List<Block> successors = <Block>[];
+
+  /// The catch block associated with the immediately enclosing try block or
+  /// `null` if not inside a try block.
+  Block catcher;
+
+  /// True if this block is the entry point to one of the bodies
+  /// (constructors can have multiple bodies).
+  bool isEntryPoint = false;
 
   String get name => 'B$index';
 
@@ -31,37 +39,33 @@ class Block {
 class BlockCollector extends StatementVisitor {
   // Accumulate a list of blocks.  The current block is the last block in
   // the list.
-  final List<Block> blocks = [new Block()..index = 0];
+  final List<Block> blocks = [];
 
   // Map tree [Label]s (break or continue targets) and [Statement]s
   // (if targets) to blocks.
   final Map<Label, Block> breakTargets = <Label, Block>{};
   final Map<Label, Block> continueTargets = <Label, Block>{};
-  final Map<Statement, Block> ifTargets = <Statement, Block>{};
+  final Map<Statement, Block> substatements = <Statement, Block>{};
+
+  Block catcher;
 
   void _addStatement(Statement statement) {
     blocks.last.statements.add(statement);
   }
+
   void _addGotoStatement(Block target) {
     blocks.last.statements.add(target);
   }
 
   void _addBlock(Block block) {
     block.index = blocks.length;
+    block.catcher = catcher;
     blocks.add(block);
   }
 
-  void collect(ExecutableDefinition node) {
-    if (node.body != null) {
-      if (node is ConstructorDefinition) {
-        for (Initializer initializer in node.initializers) {
-          if (initializer is FieldInitializer) {
-            visitStatement(initializer.body);
-          }
-        }
-      }
-      visitStatement(node.body);
-    }
+  void collect(FunctionDefinition node) {
+    _addBlock(new Block()..isEntryPoint = true);
+    visitStatement(node.body);
   }
 
   visitLabeledStatement(LabeledStatement node) {
@@ -72,18 +76,23 @@ class BlockCollector extends StatementVisitor {
     visitStatement(node.next);
   }
 
-  visitAssign(Assign node) {
+  visitReturn(Return node) {
     _addStatement(node);
-    visitStatement(node.next);
   }
 
-  visitReturn(Return node) {
+  visitThrow(Throw node) {
+    _addStatement(node);
+  }
+
+  visitUnreachable(Unreachable node) {
     _addStatement(node);
   }
 
   visitBreak(Break node) {
     _addStatement(node);
-    blocks.last.addEdgeTo(breakTargets[node.target]);
+    if (breakTargets.containsKey(node.target)) {
+      blocks.last.addEdgeTo(breakTargets[node.target]);
+    }
   }
 
   visitContinue(Continue node) {
@@ -95,8 +104,8 @@ class BlockCollector extends StatementVisitor {
     _addStatement(node);
     Block thenTarget = new Block();
     Block elseTarget = new Block();
-    ifTargets[node.thenStatement] = thenTarget;
-    ifTargets[node.elseStatement] = elseTarget;
+    substatements[node.thenStatement] = thenTarget;
+    substatements[node.elseStatement] = elseTarget;
     blocks.last.addEdgeTo(thenTarget);
     blocks.last.addEdgeTo(elseTarget);
     _addBlock(thenTarget);
@@ -116,13 +125,12 @@ class BlockCollector extends StatementVisitor {
     visitStatement(node.body);
   }
 
-  visitWhileCondition(WhileCondition node) {
+  visitFor(For node) {
     Block whileBlock = new Block();
     _addGotoStatement(whileBlock);
 
     _addBlock(whileBlock);
     _addStatement(node);
-    whileBlock.statements.add(node);
     blocks.last.addEdgeTo(whileBlock);
 
     Block bodyBlock = new Block();
@@ -137,8 +145,26 @@ class BlockCollector extends StatementVisitor {
     _addBlock(nextBlock);
     visitStatement(node.next);
 
-    ifTargets[node.body] = bodyBlock;
-    ifTargets[node.next] = nextBlock;
+    substatements[node.body] = bodyBlock;
+    substatements[node.next] = nextBlock;
+  }
+
+  visitTry(Try node) {
+    _addStatement(node);
+    Block tryBlock = new Block();
+    Block catchBlock = new Block();
+
+    Block oldCatcher = catcher;
+    catcher = catchBlock;
+    _addBlock(tryBlock);
+    visitStatement(node.tryBody);
+    catcher = oldCatcher;
+
+    _addBlock(catchBlock);
+    visitStatement(node.catchBody);
+
+    substatements[node.tryBody] = tryBlock;
+    substatements[node.catchBody] = catchBlock;
   }
 
   visitExpressionStatement(ExpressionStatement node) {
@@ -146,45 +172,43 @@ class BlockCollector extends StatementVisitor {
     visitStatement(node.next);
   }
 
-  visitFunctionDeclaration(FunctionDeclaration node) {
+  visitForeignStatement(ForeignStatement node) {
+    _addStatement(node);
+  }
+
+  visitYield(Yield node) {
     _addStatement(node);
     visitStatement(node.next);
   }
 
-  visitSetField(SetField node) {
+  visitReceiverCheck(ReceiverCheck node) {
     _addStatement(node);
     visitStatement(node.next);
   }
-
 }
 
-class TreeTracer extends TracerUtil with StatementVisitor, PassMixin {
+class TreeTracer extends TracerUtil with StatementVisitor {
+  String get passName => null;
+
   final EventSink<String> output;
 
   TreeTracer(this.output);
 
+  List<Variable> parameters;
   Names names;
   BlockCollector collector;
   int statementCounter;
 
-  void traceGraph(String name, ExecutableDefinition node) {
-    if (node is FunctionDefinition && node.isAbstract) return;
-    if (node is FieldDefinition && node.body == null) return;
+  void traceGraph(String name, FunctionDefinition node) {
+    parameters = node.parameters;
     tag("cfg", () {
       printProperty("name", name);
-      rewrite(node);
+      names = new Names();
+      statementCounter = 0;
+      collector = new BlockCollector();
+      collector.collect(node);
       collector.blocks.forEach(printBlock);
     });
-  }
-
-  @override
-  void rewriteExecutableDefinition(ExecutableDefinition node) {
-    collector = new BlockCollector();
-    names = new Names();
-    statementCounter = 0;
-    collector = new BlockCollector();
-    collector.collect(node);
-    collector.blocks.forEach(printBlock);
   }
 
   void printBlock(Block block) {
@@ -203,9 +227,16 @@ class TreeTracer extends TracerUtil with StatementVisitor, PassMixin {
         });
       });
       tag("HIR", () {
+        if (block.isEntryPoint) {
+          String params = parameters.map(names.varName).join(', ');
+          printStatement(null, 'Entry ($params)');
+        }
         if (block.label != null) {
-          printStatement(null,
-              "Label ${block.name}, useCount=${block.label.useCount}");
+          printStatement(
+              null, "Label ${block.name}, useCount=${block.label.useCount}");
+        }
+        if (block.catcher != null) {
+          printStatement(null, 'Catch exceptions at ${block.catcher.name}');
         }
         block.statements.forEach(visitBlockMember);
       });
@@ -235,30 +266,33 @@ class TreeTracer extends TracerUtil with StatementVisitor, PassMixin {
     // These do not get added to a block's list of statements.
   }
 
-  visitAssign(Assign node) {
-    String name = names.varName(node.variable);
-    String rhs = expr(node.definition);
-    String extra = node.hasExactlyOneUse ? "[single-use]" : "";
-    printStatement(null, "assign $name = $rhs $extra");
-  }
-
   visitReturn(Return node) {
     printStatement(null, "return ${expr(node.value)}");
   }
 
+  visitThrow(Throw node) {
+    printStatement(null, "throw ${expr(node.value)}");
+  }
+
+  visitUnreachable(Unreachable node) {
+    printStatement(null, "unreachable");
+  }
+
   visitBreak(Break node) {
-    printStatement(null, "break ${collector.breakTargets[node.target].name}");
+    Block block = collector.breakTargets[node.target];
+    String name = block != null ? block.name : '<missing label>';
+    printStatement(null, "break $name");
   }
 
   visitContinue(Continue node) {
-    printStatement(null,
-        "continue ${collector.continueTargets[node.target].name}");
+    printStatement(
+        null, "continue ${collector.continueTargets[node.target].name}");
   }
 
   visitIf(If node) {
     String condition = expr(node.condition);
-    String thenTarget = collector.ifTargets[node.thenStatement].name;
-    String elseTarget = collector.ifTargets[node.elseStatement].name;
+    String thenTarget = collector.substatements[node.thenStatement].name;
+    String elseTarget = collector.substatements[node.elseStatement].name;
     printStatement(null, "if $condition then $thenTarget else $elseTarget");
   }
 
@@ -266,20 +300,25 @@ class TreeTracer extends TracerUtil with StatementVisitor, PassMixin {
     printStatement(null, "while true do");
   }
 
-  visitWhileCondition(WhileCondition node) {
-    String bodyTarget = collector.ifTargets[node.body].name;
-    String nextTarget = collector.ifTargets[node.next].name;
+  visitFor(For node) {
+    String bodyTarget = collector.substatements[node.body].name;
+    String nextTarget = collector.substatements[node.next].name;
+    String updates = node.updates.map(expr).join(', ');
     printStatement(null, "while ${expr(node.condition)}");
     printStatement(null, "do $bodyTarget");
-    printStatement(null, "then $nextTarget" );
+    printStatement(null, "updates ($updates)");
+    printStatement(null, "then $nextTarget");
+  }
+
+  visitTry(Try node) {
+    String tryTarget = collector.substatements[node.tryBody].name;
+    String catchParams = node.catchParameters.map(names.varName).join(',');
+    String catchTarget = collector.substatements[node.catchBody].name;
+    printStatement(null, 'try $tryTarget catch($catchParams) $catchTarget');
   }
 
   visitExpressionStatement(ExpressionStatement node) {
     printStatement(null, expr(node.expression));
-  }
-
-  visitFunctionDeclaration(FunctionDeclaration node) {
-    printStatement(null, 'function ${node.definition.element.name}');
   }
 
   visitSetField(SetField node) {
@@ -295,6 +334,22 @@ class TreeTracer extends TracerUtil with StatementVisitor, PassMixin {
   String expr(Expression e) {
     return e.accept(new SubexpressionVisitor(names));
   }
+
+  @override
+  visitForeignStatement(ForeignStatement node) {
+    printStatement(null, 'foreign ${node.codeTemplate.source}');
+  }
+
+  @override
+  visitYield(Yield node) {
+    String name = node.hasStar ? 'yield*' : 'yield';
+    printStatement(null, '$name ${expr(node.input)}');
+  }
+
+  @override
+  visitReceiverCheck(ReceiverCheck node) {
+    printStatement(null, 'NullCheck ${expr(node.value)}');
+  }
 }
 
 class SubexpressionVisitor extends ExpressionVisitor<String> {
@@ -302,22 +357,18 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
 
   SubexpressionVisitor(this.names);
 
-  String visitVariable(Variable node) {
-    return names.varName(node);
+  String visitVariableUse(VariableUse node) {
+    return names.varName(node.variable);
+  }
+
+  String visitAssign(Assign node) {
+    String variable = names.varName(node.variable);
+    String value = visitExpression(node.value);
+    return '$variable = $value';
   }
 
   String formatArguments(Invoke node) {
-    List<String> args = new List<String>();
-    int positionalArgumentCount = node.selector.positionalArgumentCount;
-    for (int i = 0; i < positionalArgumentCount; ++i) {
-      args.add(node.arguments[i].accept(this));
-    }
-    for (int i = 0; i < node.selector.namedArgumentCount; ++i) {
-      String name = node.selector.namedArguments[i];
-      String arg = node.arguments[positionalArgumentCount + i].accept(this);
-      args.add("$name: $arg");
-    }
-    return args.join(', ');
+    return node.arguments.map(visitExpression).join(', ');
   }
 
   String visitInvokeStatic(InvokeStatic node) {
@@ -333,42 +384,36 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
     return "$receiver.$name($args)";
   }
 
-  String visitInvokeSuperMethod(InvokeSuperMethod node) {
+  String visitInvokeMethodDirectly(InvokeMethodDirectly node) {
+    String receiver = visitExpression(node.receiver);
+    String host = node.target.enclosingClass.name;
     String name = node.selector.name;
     String args = formatArguments(node);
-    return "super.$name($args)";
+    return "$receiver.$host::$name($args)";
   }
 
   String visitInvokeConstructor(InvokeConstructor node) {
+    String className = node.target.enclosingClass.name;
     String callName;
     if (node.target.name.isEmpty) {
-      callName = '${node.type}';
+      callName = '${className}';
     } else {
-      callName = '${node.type}.${node.target.name}';
+      callName = '${className}.${node.target.name}';
     }
     String args = formatArguments(node);
     String keyword = node.constant != null ? 'const' : 'new';
     return "$keyword $callName($args)";
   }
 
-  String visitConcatenateStrings(ConcatenateStrings node) {
-    String args = node.arguments.map(visitExpression).join(', ');
-    return "concat [$args]";
+  String visitOneShotInterceptor(OneShotInterceptor node) {
+    String name = node.selector.name;
+    String args = formatArguments(node);
+    return "oneshot $name($args)";
   }
 
   String visitLiteralList(LiteralList node) {
     String values = node.values.map(visitExpression).join(', ');
     return "list [$values]";
-  }
-
-  String visitLiteralMap(LiteralMap node) {
-    List<String> entries = new List<String>();
-    node.entries.forEach((LiteralMapEntry entry) {
-      String key = visitExpression(entry.key);
-      String value = visitExpression(entry.value);
-      entries.add("$key: $value");
-    });
-    return "map [${entries.join(', ')}]";
   }
 
   String visitConstant(Constant node) {
@@ -379,12 +424,11 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
     return "this";
   }
 
-  String visitReifyTypeVar(ReifyTypeVar node) {
-    return "typevar [${node.typeVariable.name}]";
-  }
-
   static bool usesInfixNotation(Expression node) {
-    return node is Conditional || node is LogicalOperator;
+    return node is Conditional ||
+        node is LogicalOperator ||
+        node is Assign ||
+        node is SetField;
   }
 
   String visitConditional(Conditional node) {
@@ -407,9 +451,9 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
   }
 
   String visitTypeOperator(TypeOperator node) {
-    String receiver = visitExpression(node.receiver);
+    String value = visitExpression(node.value);
     String type = "${node.type}";
-    return "TypeOperator $receiver ${node.operator} $type";
+    return "TypeOperator $value ${node.operator} $type";
   }
 
   String visitNot(Not node) {
@@ -418,18 +462,6 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
       operand = '($operand)';
     }
     return '!$operand';
-  }
-
-  String visitFunctionExpression(FunctionExpression node) {
-    return "function ${node.definition.element.name}";
-  }
-
-  String visitFieldInitializer(FieldInitializer node) {
-    throw "$node should not be visited by $this";
-  }
-
-  String visitSuperInitializer(SuperInitializer node) {
-    throw "$node should not be visited by $this";
   }
 
   String visitGetField(GetField node) {
@@ -441,16 +473,124 @@ class SubexpressionVisitor extends ExpressionVisitor<String> {
     return '$object.$field';
   }
 
+  String visitSetField(SetField node) {
+    String object = visitExpression(node.object);
+    String field = node.field.name;
+    if (usesInfixNotation(node.object)) {
+      object = '($object)';
+    }
+    String value = visitExpression(node.value);
+    return '$object.$field = $value';
+  }
+
+  String visitGetStatic(GetStatic node) {
+    String element = node.element.name;
+    return element;
+  }
+
+  String visitSetStatic(SetStatic node) {
+    String element = node.element.name;
+    String value = visitExpression(node.value);
+    return '$element = $value';
+  }
+
+  String visitGetTypeTestProperty(GetTypeTestProperty node) {
+    String object = visitExpression(node.object);
+    if (usesInfixNotation(node.object)) {
+      object = '($object)';
+    }
+    // TODO(sra): Fix up this.
+    return '$object."is-${node.dartType}"';
+  }
+
   String visitCreateBox(CreateBox node) {
     return 'CreateBox';
   }
 
-  String visitCreateClosureClass(CreateClosureClass node) {
+  String visitCreateInstance(CreateInstance node) {
     String className = node.classElement.name;
     String arguments = node.arguments.map(visitExpression).join(', ');
-    return 'CreateClosure $className($arguments)';
+    return 'CreateInstance $className($arguments)';
   }
 
+  @override
+  String visitReadTypeVariable(ReadTypeVariable node) {
+    return 'Read ${node.variable.element} ${visitExpression(node.target)}';
+  }
+
+  @override
+  String visitReifyRuntimeType(ReifyRuntimeType node) {
+    return 'Reify ${node.value}';
+  }
+
+  @override
+  String visitTypeExpression(TypeExpression node) {
+    String kind = '${node.kind}'.split('.').last;
+    String args = node.arguments.map(visitExpression).join(', ');
+    return 'TypeExpression($kind, ${node.dartType}, $args)';
+  }
+
+  @override
+  String visitCreateInvocationMirror(CreateInvocationMirror node) {
+    String args = node.arguments.map(visitExpression).join(', ');
+    return 'CreateInvocationMirror(${node.selector.name}, $args)';
+  }
+
+  @override
+  String visitInterceptor(Interceptor node) {
+    return 'Interceptor(${visitExpression(node.input)})';
+  }
+
+  @override
+  String visitForeignExpression(ForeignExpression node) {
+    String arguments = node.arguments.map(visitExpression).join(', ');
+    return 'Foreign "${node.codeTemplate.source}"($arguments)';
+  }
+
+  @override
+  String visitApplyBuiltinOperator(ApplyBuiltinOperator node) {
+    String args = node.arguments.map(visitExpression).join(', ');
+    return 'ApplyBuiltinOperator ${node.operator} ($args)';
+  }
+
+  @override
+  String visitApplyBuiltinMethod(ApplyBuiltinMethod node) {
+    String receiver = visitExpression(node.receiver);
+    String args = node.arguments.map(visitExpression).join(', ');
+    return 'ApplyBuiltinMethod ${node.method} $receiver ($args)';
+  }
+
+  @override
+  String visitGetLength(GetLength node) {
+    String object = visitExpression(node.object);
+    return 'GetLength($object)';
+  }
+
+  @override
+  String visitGetIndex(GetIndex node) {
+    String object = visitExpression(node.object);
+    String index = visitExpression(node.index);
+    return 'GetIndex($object, $index)';
+  }
+
+  @override
+  String visitSetIndex(SetIndex node) {
+    String object = visitExpression(node.object);
+    String index = visitExpression(node.index);
+    String value = visitExpression(node.value);
+    return 'SetIndex($object, $index, $value)';
+  }
+
+  @override
+  String visitAwait(Await node) {
+    String value = visitExpression(node.input);
+    return 'Await($value)';
+  }
+
+  String visitYield(Yield node) {
+    String value = visitExpression(node.input);
+    return 'Yield($value)';
+  }
 }
 
 /**

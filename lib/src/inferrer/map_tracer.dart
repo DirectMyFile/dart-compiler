@@ -2,28 +2,34 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of type_graph_inferrer;
+library compiler.src.inferrer.map_tracer;
 
-Set<String> okMapSelectorsSet = new Set.from(
-    const <String>[
-      // From Object.
-      "==",
-      "hashCode",
-      "toString",
-      "noSuchMethod",
-      "runtimeType",
-      // From Map
-      "[]",
-      "isEmpty",
-      "isNotEmpty",
-      "keys",
-      "length",
-      "values",
-      "clear",
-      "containsKey",
-      "containsValue",
-      "forEach",
-      "remove"]);
+import '../elements/elements.dart';
+import '../universe/selector.dart' show Selector;
+
+import 'node_tracer.dart';
+import 'type_graph_nodes.dart';
+
+Set<String> okMapSelectorsSet = new Set.from(const <String>[
+  // From Object.
+  "==",
+  "hashCode",
+  "toString",
+  "noSuchMethod",
+  "runtimeType",
+  // From Map
+  "[]",
+  "isEmpty",
+  "isNotEmpty",
+  "keys",
+  "length",
+  "values",
+  "clear",
+  "containsKey",
+  "containsValue",
+  "forEach",
+  "remove"
+]);
 
 class MapTracerVisitor extends TracerVisitor<MapTypeInformation> {
   // These lists are used to keep track of newly discovered assignments to
@@ -61,7 +67,7 @@ class MapTracerVisitor extends TracerVisitor<MapTypeInformation> {
   visitStaticCallSiteTypeInformation(StaticCallSiteTypeInformation info) {
     super.visitStaticCallSiteTypeInformation(info);
     Element called = info.calledElement;
-    if (called.isForeign(compiler.backend) && called.name == 'JS') {
+    if (compiler.backend.isForeign(called) && called.name == 'JS') {
       bailout('Used in JS ${info.call}');
     }
   }
@@ -73,7 +79,6 @@ class MapTracerVisitor extends TracerVisitor<MapTypeInformation> {
     if (currentUser == info.receiver) {
       if (!okMapSelectorsSet.contains(selectorName)) {
         if (selector.isCall) {
-          int positionalLength = info.arguments.positional.length;
           if (selectorName == 'addAll') {
             // All keys and values from the argument flow into
             // the map.
@@ -116,7 +121,7 @@ class MapTracerVisitor extends TracerVisitor<MapTypeInformation> {
         }
       }
     } else if (selector.isCall &&
-               !info.targets.every((element) => element.isFunction)) {
+        !info.targets.every((element) => element.isFunction)) {
       bailout('Passed to a closure');
       return;
     }

@@ -2,11 +2,36 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of tree_ir.optimization;
+library tree_ir.optimization.loop_rewriter;
 
-/// Rewrites [WhileTrue] statements with an [If] body into a [WhileCondition],
-/// in situations where only one of the branches contains a [Continue] to the
-/// loop. Schematically:
+import 'optimization.dart' show Pass;
+import '../tree_ir_nodes.dart';
+
+/// Rewrites [WhileTrue] statements into [For] statements.
+///
+/// Before this phase, loops usually contain a lot of "exit code", that is,
+/// code that happens at a point where a [Continue] can no longer be reached,
+/// and is therefore not really part of the loop.
+/// Exit code is moved down after the loop using the following rewrites rules:
+///
+/// EXTRACT LABELED STATEMENT:
+///
+///   L:
+///   while (true) {
+///     L2: {
+///       S1  (has references to L)
+///     }
+///     S2    (has no references to L)
+///   }
+///
+///     ==>
+///
+///   L2: {
+///     L: while (true) S1
+///   }
+///   S2
+///
+/// INTRODUCE CONDITIONAL LOOP:
 ///
 ///   L:
 ///   while (true) {
@@ -25,41 +50,41 @@ part of tree_ir.optimization;
 ///
 /// A similar transformation is used when S2 occurs in the 'then' position.
 ///
-/// Note that the above pattern needs no iteration since nested ifs
-/// have been collapsed previously in the [StatementRewriter] phase.
-class LoopRewriter extends RecursiveVisitor with PassMixin {
+/// Note that the pattern above needs no iteration since nested ifs have been
+/// collapsed previously in the [StatementRewriter] phase.
+///
+///
+/// PULL INTO UPDATE EXPRESSION:
+///
+/// Assignment expressions before the unique continue to a [whileCondition] are
+/// pulled into the updates for the loop.
+///
+///   L:
+///   for (; condition; updates) {
+///     S [ x = E; continue L ]
+///   }
+///     ==>
+///   L:
+///   for (; condition; updates, x = E) {
+///     S [ continue L ]
+///   }
+///
+/// The decision to only pull in assignments is a heuristic to balance
+/// readability and stack trace usability versus the modest code size
+/// reduction one might get by aggressively moving expressions into the
+/// updates.
+class LoopRewriter extends RecursiveTransformer implements Pass {
+  String get passName => 'Loop rewriter';
 
   Set<Label> usedContinueLabels = new Set<Label>();
 
-  void rewriteExecutableDefinition(ExecutableDefinition root) {
+  /// Maps loop labels to a list, if that loop can accept update expressions.
+  /// The list will then be populated while traversing the body of that loop.
+  /// If a loop is not in the map, update expressions cannot be hoisted there.
+  Map<Label, List<Expression>> updateExpressions = <Label, List<Expression>>{};
+
+  void rewrite(FunctionDefinition root) {
     root.body = visitStatement(root.body);
-  }
-
-  Statement visitLabeledStatement(LabeledStatement node) {
-    node.body = visitStatement(node.body);
-    node.next = visitStatement(node.next);
-    return node;
-  }
-
-  Statement visitAssign(Assign node) {
-    // Clean up redundant assignments left behind in the previous phase.
-    if (node.variable == node.definition) {
-      --node.variable.readCount;
-      --node.variable.writeCount;
-      return visitStatement(node.next);
-    }
-    visitExpression(node.definition);
-    node.next = visitStatement(node.next);
-    return node;
-  }
-
-  Statement visitReturn(Return node) {
-    visitExpression(node.value);
-    return node;
-  }
-
-  Statement visitBreak(Break node) {
-    return node;
   }
 
   Statement visitContinue(Continue node) {
@@ -67,72 +92,104 @@ class LoopRewriter extends RecursiveVisitor with PassMixin {
     return node;
   }
 
-  Statement visitIf(If node) {
-    visitExpression(node.condition);
-    node.thenStatement = visitStatement(node.thenStatement);
-    node.elseStatement = visitStatement(node.elseStatement);
-    return node;
-  }
-
   Statement visitWhileTrue(WhileTrue node) {
     assert(!usedContinueLabels.contains(node.label));
+
+    // Pull labeled statements outside the loop when possible.
+    // [head] and [tail] are the first and last labeled statements that were
+    // pulled out, and null when none have been pulled out.
+    LabeledStatement head, tail;
+    while (node.body is LabeledStatement) {
+      LabeledStatement inner = node.body;
+      inner.next = visitStatement(inner.next);
+      bool nextHasContinue = usedContinueLabels.remove(node.label);
+      if (nextHasContinue) break;
+      node.body = inner.body;
+      inner.body = node;
+      if (head == null) {
+        head = tail = inner;
+      } else {
+        tail.body = inner;
+        tail = inner;
+      }
+    }
+
+    // Rewrite while(true) to for(; condition; updates).
+    Statement loop = node;
     if (node.body is If) {
       If body = node.body;
+      updateExpressions[node.label] = <Expression>[];
       body.thenStatement = visitStatement(body.thenStatement);
       bool thenHasContinue = usedContinueLabels.remove(node.label);
       body.elseStatement = visitStatement(body.elseStatement);
       bool elseHasContinue = usedContinueLabels.remove(node.label);
       if (thenHasContinue && !elseHasContinue) {
         node.label.binding = null; // Prepare to rebind the label.
-        return new WhileCondition(
+        loop = new For(
             node.label,
             body.condition,
+            updateExpressions[node.label],
             body.thenStatement,
             body.elseStatement);
       } else if (!thenHasContinue && elseHasContinue) {
         node.label.binding = null;
-        return new WhileCondition(
+        loop = new For(
             node.label,
             new Not(body.condition),
+            updateExpressions[node.label],
             body.elseStatement,
             body.thenStatement);
       }
+    } else if (node.body is LabeledStatement) {
+      // If the body is a labeled statement, its .next has already been visited.
+      LabeledStatement body = node.body;
+      body.body = visitStatement(body.body);
+      usedContinueLabels.remove(node.label);
     } else {
       node.body = visitStatement(node.body);
       usedContinueLabels.remove(node.label);
     }
-    return node;
-  }
 
-  Statement visitWhileCondition(WhileCondition node) {
-    // Note: not reachable but the implementation is trivial
-    visitExpression(node.condition);
-    node.body = visitStatement(node.body);
-    node.next = visitStatement(node.next);
-    return node;
+    if (head == null) return loop;
+    tail.body = loop;
+    return head;
   }
 
   Statement visitExpressionStatement(ExpressionStatement node) {
-    visitExpression(node.expression);
-    node.next = visitStatement(node.next);
-    return node;
+    if (updateExpressions.isEmpty) {
+      // Avoid allocating a list if there is no loop.
+      return super.visitExpressionStatement(node);
+    }
+    List<ExpressionStatement> statements = <ExpressionStatement>[];
+    while (node.next is ExpressionStatement) {
+      statements.add(node);
+      node = node.next;
+    }
+    statements.add(node);
+    Statement next = visitStatement(node.next);
+    if (next is Continue && next.target.useCount == 1) {
+      List<Expression> updates = updateExpressions[next.target];
+      if (updates != null) {
+        // Pull expressions before the continue into the for loop update.
+        // As a heuristic, we only pull in assignment expressions.
+        // Determine the index of the first assignment to pull in.
+        int index = statements.length;
+        while (index > 0 && statements[index - 1].expression is Assign) {
+          --index;
+        }
+        for (ExpressionStatement stmt in statements.skip(index)) {
+          updates.add(stmt.expression);
+        }
+        if (index > 0) {
+          statements[index - 1].next = next;
+          return statements.first;
+        } else {
+          return next;
+        }
+      }
+    }
+    // The expression statements could not be pulled into a loop update.
+    node.next = next;
+    return statements.first;
   }
-
-  Statement visitFunctionDeclaration(FunctionDeclaration node) {
-    new LoopRewriter().rewrite(node.definition);
-    node.next = visitStatement(node.next);
-    return node;
-  }
-
-  void visitFunctionExpression(FunctionExpression node) {
-    new LoopRewriter().rewrite(node.definition);
-  }
-
-  Statement visitSetField(SetField node) {
-    visitExpression(node.object);
-    visitExpression(node.value);
-    node.next = visitStatement(node.next);
-    return node;
-  }
-
 }

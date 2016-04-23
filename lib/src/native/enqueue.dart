@@ -2,7 +2,26 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of native;
+import 'dart:collection' show Queue;
+
+import '../common.dart';
+import '../common/backend_api.dart' show ForeignResolver;
+import '../common/registry.dart' show Registry;
+import '../common/resolution.dart' show Resolution;
+import '../compiler.dart' show Compiler;
+import '../constants/values.dart';
+import '../core_types.dart' show CoreTypes;
+import '../dart_types.dart';
+import '../elements/elements.dart';
+import '../elements/modelx.dart' show FunctionElementX;
+import '../enqueue.dart' show Enqueuer;
+import '../js_backend/backend_helpers.dart' show BackendHelpers;
+import '../js_backend/js_backend.dart';
+import '../js_emitter/js_emitter.dart' show CodeEmitterTask, NativeEmitter;
+import '../tokens/token.dart' show BeginGroupToken, Token;
+import '../tokens/token_constants.dart' as Tokens show EOF_TOKEN;
+import '../tree/tree.dart';
+import 'behavior.dart';
 
 /**
  * This could be an abstract class but we use it as a stub for the dart_backend.
@@ -10,6 +29,10 @@ part of native;
 class NativeEnqueuer {
   /// Initial entry point to native enqueuer.
   void processNativeClasses(Iterable<LibraryElement> libraries) {}
+
+  /// Registers the [nativeBehavior]. Adds the liveness of its instantiated
+  /// types to the world.
+  void registerNativeBehavior(NativeBehavior nativeBehavior, cause) {}
 
   /// Notification of a main Enqueuer worklist element.  For methods, adds
   /// information from metadata attributes, and computes types instantiated due
@@ -25,34 +48,8 @@ class NativeEnqueuer {
   /// Computes types instantiated due to setting a native field.
   void registerFieldStore(Element field) {}
 
-  NativeBehavior getNativeBehaviorOf(Send node) => new NativeBehavior();
-
   /// Returns whether native classes are being used.
   bool hasInstantiatedNativeClasses() => false;
-
-  /**
-   * Handles JS-calls, which can be an instantiation point for types.
-   *
-   * For example, the following code instantiates and returns native classes
-   * that are `_DOMWindowImpl` or a subtype.
-   *
-   *     JS('_DOMWindowImpl', 'window')
-   *
-   */
-  // TODO(sra): The entry from codegen will not have a resolver.
-  void registerJsCall(Send node, ResolverVisitor resolver) {}
-
-  /**
-   * Handles JS-embedded global calls, which can be an instantiation point for
-   * types.
-   *
-   * For example, the following code instantiates and returns a String class
-   *
-   *     JS_EMBEDDED_GLOBAL('String', 'foo')
-   *
-   */
-  // TODO(sra): The entry from codegen will not have a resolver.
-  void registerJsEmbeddedGlobalCall(Send node, ResolverVisitor resolver) {}
 
   /// Emits a summary information using the [log] function.
   void logSummary(log(message)) {}
@@ -63,8 +60,8 @@ class NativeEnqueuer {
   ClassElement get annotationJsNameClass => null;
 }
 
-
 abstract class NativeEnqueuerBase implements NativeEnqueuer {
+  static final RegExp _identifier = new RegExp(r'^[a-zA-Z_$][a-zA-Z0-9_$]*$');
 
   /**
    * The set of all native classes.  Each native class is in [nativeClasses] and
@@ -96,10 +93,6 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   final queue = new Queue();
   bool flushing = false;
 
-  /// Maps JS foreign calls to their computed native behavior.
-  final Map<Node, NativeBehavior> nativeBehaviors =
-      new Map<Node, NativeBehavior>();
-
   final Enqueuer world;
   final Compiler compiler;
   final bool enableLiveTypeAnalysis;
@@ -114,17 +107,22 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
         processedLibraries = compiler.cacheStrategy.newSet();
 
   JavaScriptBackend get backend => compiler.backend;
+  BackendHelpers get helpers => backend.helpers;
+  Resolution get resolution => compiler.resolution;
+
+  DiagnosticReporter get reporter => compiler.reporter;
+  CoreTypes get coreTypes => compiler.coreTypes;
 
   void processNativeClasses(Iterable<LibraryElement> libraries) {
-    if (compiler.hasIncrementalSupport) {
+    if (compiler.options.hasIncrementalSupport) {
       // Since [Set.add] returns bool if an element was added, this restricts
       // [libraries] to ones that haven't already been processed. This saves
       // time during incremental compiles.
       libraries = libraries.where(processedLibraries.add);
     }
     libraries.forEach(processNativeClassesInLibrary);
-    if (backend.isolateHelperLibrary != null) {
-      processNativeClassesInLibrary(backend.isolateHelperLibrary);
+    if (helpers.isolateHelperLibrary != null) {
+      processNativeClassesInLibrary(helpers.isolateHelperLibrary);
     }
     processSubclassesOfNativeClasses(libraries);
     if (!enableLiveTypeAnalysis) {
@@ -136,7 +134,7 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   void processNativeClassesInLibrary(LibraryElement library) {
     // Use implementation to ensure the inclusion of injected members.
     library.implementation.forEachLocalMember((Element element) {
-      if (element.isClass && element.isNative) {
+      if (element.isClass && backend.isNative(element)) {
         processNativeClass(element);
       }
     });
@@ -146,7 +144,7 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     nativeClasses.add(classElement);
     unusedClasses.add(classElement);
     // Resolve class to ensure the class has valid inheritance info.
-    classElement.ensureResolved(compiler);
+    classElement.ensureResolved(resolution);
   }
 
   void processSubclassesOfNativeClasses(Iterable<LibraryElement> libraries) {
@@ -161,13 +159,10 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     libraries.forEach((library) {
       library.implementation.forEachLocalMember((element) {
         if (element.isClass) {
-          String name = element.name;
           String extendsName = findExtendsNameOfClass(element);
           if (extendsName != null) {
-            Set<ClassElement> potentialSubclasses =
-                potentialExtends.putIfAbsent(
-                    extendsName,
-                    () => new Set<ClassElement>());
+            Set<ClassElement> potentialSubclasses = potentialExtends
+                .putIfAbsent(extendsName, () => new Set<ClassElement>());
             potentialSubclasses.add(element);
           }
         }
@@ -179,21 +174,21 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     // fact a subclass of a native class.
 
     ClassElement nativeSuperclassOf(ClassElement classElement) {
-      if (classElement.isNative) return classElement;
+      if (backend.isNative(classElement)) return classElement;
       if (classElement.superclass == null) return null;
       return nativeSuperclassOf(classElement.superclass);
     }
 
     void walkPotentialSubclasses(ClassElement element) {
       if (nativeClassesAndSubclasses.contains(element)) return;
-      element.ensureResolved(compiler);
+      element.ensureResolved(resolution);
       ClassElement nativeSuperclass = nativeSuperclassOf(element);
       if (nativeSuperclass != null) {
         nativeClassesAndSubclasses.add(element);
-        if (!element.isNative) {
-          nonNativeSubclasses.putIfAbsent(nativeSuperclass,
-              () => new Set<ClassElement>())
-            .add(element);
+        if (!backend.isNative(element)) {
+          nonNativeSubclasses
+              .putIfAbsent(nativeSuperclass, () => new Set<ClassElement>())
+              .add(element);
         }
         Set<ClassElement> potentialSubclasses = potentialExtends[element.name];
         if (potentialSubclasses != null) {
@@ -213,6 +208,17 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
    * `null` if there is no extends clause.
    */
   String findExtendsNameOfClass(ClassElement classElement) {
+    if (classElement.isResolved) {
+      ClassElement superClass = classElement.superclass;
+      while (superClass != null) {
+        if (!superClass.isUnnamedMixinApplication) {
+          return superClass.name;
+        }
+        superClass = superClass.superclass;
+      }
+      return null;
+    }
+
     //  "class B extends A ... {}"  --> "A"
     //  "class B extends foo.A ... {}"  --> "A"
     //  "class B<T> extends foo.A<T,T> with M1, M2 ... {}"  --> "A"
@@ -251,7 +257,7 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
       if (token.stringValue != 'extends') return null;
       token = token.next;
       Token id = token;
-      while (token.kind != EOF_TOKEN) {
+      while (token.kind != Tokens.EOF_TOKEN) {
         token = token.next;
         if (token.stringValue != '.') break;
         token = token.next;
@@ -262,7 +268,7 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
       return id.value;
     }
 
-    return compiler.withCurrentElement(classElement, () {
+    return reporter.withCurrentElement(classElement, () {
       return scanForExtendsName(classElement.position);
     });
   }
@@ -285,9 +291,9 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   void findAnnotationClasses() {
     if (_annotationCreatesClass != null) return;
     ClassElement find(name) {
-      Element e = backend.findHelper(name);
+      Element e = helpers.findHelper(name);
       if (e == null || e is! ClassElement) {
-        compiler.internalError(NO_LOCATION_SPANNABLE,
+        reporter.internalError(NO_LOCATION_SPANNABLE,
             "Could not find implementation class '${name}'.");
       }
       return e;
@@ -302,30 +308,27 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   String findJsNameFromAnnotation(Element element) {
     String name = null;
     ClassElement annotationClass = annotationJsNameClass;
-    for (Link<MetadataAnnotation> link = element.metadata;
-         !link.isEmpty;
-         link = link.tail) {
-      MetadataAnnotation annotation = link.head.ensureResolved(compiler);
-      ConstantValue value = annotation.constant.value;
+    for (MetadataAnnotation annotation in element.implementation.metadata) {
+      annotation.ensureResolved(resolution);
+      ConstantValue value =
+          compiler.constants.getConstantValue(annotation.constant);
       if (!value.isConstructedObject) continue;
       ConstructedConstantValue constructedObject = value;
       if (constructedObject.type.element != annotationClass) continue;
 
-      List<ConstantValue> fields = constructedObject.fields;
+      Iterable<ConstantValue> fields = constructedObject.fields.values;
       // TODO(sra): Better validation of the constant.
-      if (fields.length != 1 || fields[0] is! StringConstantValue) {
-        PartialMetadataAnnotation partial = annotation;
-        compiler.internalError(annotation,
-            'Annotations needs one string: ${partial.parseNode(compiler)}');
+      if (fields.length != 1 || fields.single is! StringConstantValue) {
+        reporter.internalError(
+            annotation, 'Annotations needs one string: ${annotation.node}');
       }
-      StringConstantValue specStringConstant = fields[0];
+      StringConstantValue specStringConstant = fields.single;
       String specString = specStringConstant.toDartString().slowToString();
       if (name == null) {
         name = specString;
       } else {
-        PartialMetadataAnnotation partial = annotation;
-        compiler.internalError(annotation,
-            'Too many JSName annotations: ${partial.parseNode(compiler)}');
+        reporter.internalError(
+            annotation, 'Too many JSName annotations: ${annotation.node}');
       }
     }
     return name;
@@ -335,7 +338,9 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     assert(unusedClasses.contains(classElement));
     unusedClasses.remove(classElement);
     pendingClasses.add(classElement);
-    queue.add(() { processClass(classElement, cause); });
+    queue.add(() {
+      processClass(classElement, cause);
+    });
   }
 
   void flushQueue() {
@@ -347,21 +352,19 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     flushing = false;
   }
 
-  processClass(ClassElementX classElement, cause) {
+  processClass(ClassElement classElement, cause) {
     // TODO(ahe): Fix this assertion to work in incremental compilation.
-    assert(compiler.hasIncrementalSupport ||
-           !registeredClasses.contains(classElement));
+    assert(compiler.options.hasIncrementalSupport ||
+        !registeredClasses.contains(classElement));
 
     bool firstTime = registeredClasses.isEmpty;
     pendingClasses.remove(classElement);
     registeredClasses.add(classElement);
 
     // TODO(ahe): Is this really a global dependency?
-    world.registerInstantiatedClass(classElement, compiler.globalDependencies);
-
-    // Also parse the node to know all its methods because otherwise it will
-    // only be parsed if there is a call to one of its constructors.
-    classElement.parseNode(compiler);
+    classElement.ensureResolved(resolution);
+    compiler.backend.registerInstantiatedType(
+        classElement.rawType, world, compiler.globalDependencies);
 
     if (firstTime) {
       queue.add(onFirstNativeClass);
@@ -369,15 +372,18 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   }
 
   registerElement(Element element) {
-    compiler.withCurrentElement(element, () {
-      if (element.isFunction || element.isGetter || element.isSetter) {
+    reporter.withCurrentElement(element, () {
+      if (element.isFunction ||
+          element.isFactoryConstructor ||
+          element.isGetter ||
+          element.isSetter) {
         handleMethodAnnotations(element);
-        if (element.isNative) {
+        if (backend.isNative(element)) {
           registerMethodUsed(element);
         }
       } else if (element.isField) {
         handleFieldAnnotations(element);
-        if (element.isNative) {
+        if (backend.isNative(element)) {
           registerFieldLoad(element);
           registerFieldStore(element);
         }
@@ -385,37 +391,76 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     });
   }
 
-  handleFieldAnnotations(Element element) {
-    if (element.enclosingElement.isNative) {
+  void handleFieldAnnotations(Element element) {
+    if (compiler.serialization.isDeserialized(element)) {
+      return;
+    }
+    if (backend.isNative(element.enclosingElement)) {
       // Exclude non-instance (static) fields - they not really native and are
       // compiled as isolate globals.  Access of a property of a constructor
       // function or a non-method property in the prototype chain, must be coded
       // using a JS-call.
       if (element.isInstanceMember) {
-        setNativeName(element);
+        _setNativeName(element);
       }
     }
   }
 
-  handleMethodAnnotations(Element method) {
+  void handleMethodAnnotations(Element method) {
+    if (compiler.serialization.isDeserialized(method)) {
+      return;
+    }
     if (isNativeMethod(method)) {
-      setNativeName(method);
+      if (method.isStatic) {
+        _setNativeNameForStaticMethod(method);
+      } else {
+        _setNativeName(method);
+      }
     }
   }
 
   /// Sets the native name of [element], either from an annotation, or
   /// defaulting to the Dart name.
-  void setNativeName(Element element) {
+  void _setNativeName(MemberElement element) {
     String name = findJsNameFromAnnotation(element);
     if (name == null) name = element.name;
-    element.setNative(name);
+    backend.nativeData.setNativeMemberName(element, name);
   }
 
+  /// Sets the native name of the static native method [element], using the
+  /// following rules:
+  /// 1. If [element] has a @JSName annotation that is an identifier, qualify
+  ///    that identifier to the @Native name of the enclosing class
+  /// 2. If [element] has a @JSName annotation that is not an identifier,
+  ///    use the declared @JSName as the expression
+  /// 3. If [element] does not have a @JSName annotation, qualify the name of
+  ///    the method with the @Native name of the enclosing class.
+  void _setNativeNameForStaticMethod(MethodElement element) {
+    String name = findJsNameFromAnnotation(element);
+    if (name == null) name = element.name;
+    if (isIdentifier(name)) {
+      List<String> nativeNames =
+          backend.nativeData.getNativeTagsOfClassRaw(element.enclosingClass);
+      if (nativeNames.length != 1) {
+        reporter.internalError(
+            element,
+            'Unable to determine a native name for the enclosing class, '
+            'options: $nativeNames');
+      }
+      backend.nativeData
+          .setNativeMemberName(element, '${nativeNames[0]}.$name');
+    } else {
+      backend.nativeData.setNativeMemberName(element, name);
+    }
+  }
+
+  bool isIdentifier(String s) => _identifier.hasMatch(s);
+
   bool isNativeMethod(FunctionElementX element) {
-    if (!element.library.canUseNative) return false;
+    if (!backend.canLibraryUseNative(element.library)) return false;
     // Native method?
-    return compiler.withCurrentElement(element, () {
-      Node node = element.parseNode(compiler);
+    return reporter.withCurrentElement(element, () {
+      Node node = element.parseNode(resolution.parsingContext);
       if (node is! FunctionExpression) return false;
       FunctionExpression functionExpression = node;
       node = functionExpression.body;
@@ -425,43 +470,22 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     });
   }
 
+  void registerNativeBehavior(NativeBehavior nativeBehavior, cause) {
+    processNativeBehavior(nativeBehavior, cause);
+    flushQueue();
+  }
+
   void registerMethodUsed(Element method) {
-    processNativeBehavior(
-        NativeBehavior.ofMethod(method, compiler),
-        method);
-      flushQueue();
+    registerNativeBehavior(NativeBehavior.ofMethod(method, compiler), method);
   }
 
   void registerFieldLoad(Element field) {
-    processNativeBehavior(
-        NativeBehavior.ofFieldLoad(field, compiler),
-        field);
-    flushQueue();
+    registerNativeBehavior(NativeBehavior.ofFieldLoad(field, compiler), field);
   }
 
   void registerFieldStore(Element field) {
-    processNativeBehavior(
-        NativeBehavior.ofFieldStore(field, compiler),
-        field);
-    flushQueue();
+    registerNativeBehavior(NativeBehavior.ofFieldStore(field, compiler), field);
   }
-
-  void registerJsCall(Send node, ResolverVisitor resolver) {
-    NativeBehavior behavior = NativeBehavior.ofJsCall(node, compiler, resolver);
-    processNativeBehavior(behavior, node);
-    nativeBehaviors[node] = behavior;
-    flushQueue();
-  }
-
-  void registerJsEmbeddedGlobalCall(Send node, ResolverVisitor resolver) {
-    NativeBehavior behavior =
-        NativeBehavior.ofJsEmbeddedGlobalCall(node, compiler, resolver);
-    processNativeBehavior(behavior, node);
-    nativeBehaviors[node] = behavior;
-    flushQueue();
-  }
-
-  NativeBehavior getNativeBehaviorOf(Send node) => nativeBehaviors[node];
 
   processNativeBehavior(NativeBehavior behavior, cause) {
     // TODO(ahe): Is this really a global dependency?
@@ -472,27 +496,29 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
       matchedTypeConstraints.add(type);
       if (type is SpecialType) {
         if (type == SpecialType.JsObject) {
-          world.registerInstantiatedClass(compiler.objectClass, registry);
+          backend.registerInstantiatedType(
+              compiler.coreTypes.objectType, world, registry);
         }
         continue;
       }
       if (type is InterfaceType) {
-        if (type.element == compiler.intClass) {
-          world.registerInstantiatedClass(compiler.intClass, registry);
-        } else if (type.element == compiler.doubleClass) {
-          world.registerInstantiatedClass(compiler.doubleClass, registry);
-        } else if (type.element == compiler.numClass) {
-          world.registerInstantiatedClass(compiler.doubleClass, registry);
-          world.registerInstantiatedClass(compiler.intClass, registry);
-        } else if (type.element == compiler.stringClass) {
-          world.registerInstantiatedClass(compiler.stringClass, registry);
-        } else if (type.element == compiler.nullClass) {
-          world.registerInstantiatedClass(compiler.nullClass, registry);
-        } else if (type.element == compiler.boolClass) {
-          world.registerInstantiatedClass(compiler.boolClass, registry);
-        } else if (compiler.types.isSubtype(
-                      type, backend.listImplementation.rawType)) {
-          world.registerInstantiatedClass(type.element, registry);
+        if (type == coreTypes.intType) {
+          backend.registerInstantiatedType(type, world, registry);
+        } else if (type == coreTypes.doubleType) {
+          backend.registerInstantiatedType(type, world, registry);
+        } else if (type == coreTypes.numType) {
+          backend.registerInstantiatedType(
+              coreTypes.doubleType, world, registry);
+          backend.registerInstantiatedType(coreTypes.intType, world, registry);
+        } else if (type == coreTypes.stringType) {
+          backend.registerInstantiatedType(type, world, registry);
+        } else if (type == coreTypes.nullType) {
+          backend.registerInstantiatedType(type, world, registry);
+        } else if (type == coreTypes.boolType) {
+          backend.registerInstantiatedType(type, world, registry);
+        } else if (compiler.types
+            .isSubtype(type, backend.listImplementation.rawType)) {
+          backend.registerInstantiatedType(type, world, registry);
         }
       }
       assert(type is DartType);
@@ -505,13 +531,12 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
     // Give an info so that library developers can compile with -v to find why
     // all the native classes are included.
     if (unusedClasses.isEmpty && !allUsedBefore) {
-      compiler.log('All native types marked as used due to $cause.');
+      reporter.log('All native types marked as used due to $cause.');
     }
   }
 
-  enqueueUnusedClassesMatching(bool predicate(classElement),
-                               cause,
-                               [String reason]) {
+  enqueueUnusedClassesMatching(bool predicate(classElement), cause,
+      [String reason]) {
     Iterable matches = unusedClasses.where(predicate);
     matches.toList().forEach((c) => enqueueClass(c, cause));
   }
@@ -519,7 +544,7 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
   onFirstNativeClass() {
     staticUse(name) {
       backend.enqueue(
-          world, backend.findHelper(name), compiler.globalDependencies);
+          world, helpers.findHelper(name), compiler.globalDependencies);
     }
 
     staticUse('defineProperty');
@@ -531,34 +556,33 @@ abstract class NativeEnqueuerBase implements NativeEnqueuer {
 
   addNativeExceptions() {
     enqueueUnusedClassesMatching((classElement) {
-        // TODO(sra): Annotate exception classes in dart:html.
-        String name = classElement.name;
-        if (name.contains('Exception')) return true;
-        if (name.contains('Error')) return true;
-        return false;
-      },
-      'native exception');
+      // TODO(sra): Annotate exception classes in dart:html.
+      String name = classElement.name;
+      if (name.contains('Exception')) return true;
+      if (name.contains('Error')) return true;
+      return false;
+    }, 'native exception');
   }
 }
 
-
 class NativeResolutionEnqueuer extends NativeEnqueuerBase {
-
   Map<String, ClassElement> tagOwner = new Map<String, ClassElement>();
 
   NativeResolutionEnqueuer(Enqueuer world, Compiler compiler)
-    : super(world, compiler, compiler.enableNativeLiveTypeAnalysis);
+      : super(world, compiler, compiler.options.enableNativeLiveTypeAnalysis);
 
   void processNativeClass(ClassElement classElement) {
     super.processNativeClass(classElement);
 
+    // Js Interop interfaces do not have tags.
+    if (backend.isJsInterop(classElement)) return;
     // Since we map from dispatch tags to classes, a dispatch tag must be used
     // on only one native class.
-    for (String tag in nativeTagsOfClass(classElement)) {
+    for (String tag in backend.nativeData.getNativeTagsOfClass(classElement)) {
       ClassElement owner = tagOwner[tag];
       if (owner != null) {
         if (owner != classElement) {
-          compiler.internalError(
+          reporter.internalError(
               classElement, "Tag '$tag' already in use by '${owner.name}'");
         }
       } else {
@@ -571,17 +595,67 @@ class NativeResolutionEnqueuer extends NativeEnqueuerBase {
     log('Resolved ${registeredClasses.length} native elements used, '
         '${unusedClasses.length} native elements dead.');
   }
+
+  /**
+   * Handles JS-calls, which can be an instantiation point for types.
+   *
+   * For example, the following code instantiates and returns native classes
+   * that are `_DOMWindowImpl` or a subtype.
+   *
+   *     JS('_DOMWindowImpl', 'window')
+   *
+   */
+  NativeBehavior resolveJsCall(Send node, ForeignResolver resolver) {
+    NativeBehavior behavior = NativeBehavior.ofJsCall(
+        node, reporter, compiler.parsingContext, compiler.coreTypes, resolver);
+    // TODO(johnniwinther): Move registration to the world impact application.
+    registerNativeBehavior(behavior, node);
+    return behavior;
+  }
+
+  /**
+   * Handles JS-embedded global calls, which can be an instantiation point for
+   * types.
+   *
+   * For example, the following code instantiates and returns a String class
+   *
+   *     JS_EMBEDDED_GLOBAL('String', 'foo')
+   *
+   */
+  NativeBehavior resolveJsEmbeddedGlobalCall(
+      Send node, ForeignResolver resolver) {
+    NativeBehavior behavior = NativeBehavior.ofJsEmbeddedGlobalCall(
+        node, reporter, compiler.parsingContext, compiler.coreTypes, resolver);
+    // TODO(johnniwinther): Move registration to the world impact application.
+    registerNativeBehavior(behavior, node);
+    return behavior;
+  }
+
+  /**
+   * Handles JS-compiler builtin calls, which can be an instantiation point for
+   * types.
+   *
+   * For example, the following code instantiates and returns a String class
+   *
+   *     JS_BUILTIN('String', 'int2string', 0)
+   *
+   */
+  NativeBehavior resolveJsBuiltinCall(Send node, ForeignResolver resolver) {
+    NativeBehavior behavior = NativeBehavior.ofJsBuiltinCall(
+        node, reporter, compiler.parsingContext, compiler.coreTypes, resolver);
+    // TODO(johnniwinther): Move registration to the world impact application.
+    registerNativeBehavior(behavior, node);
+    return behavior;
+  }
 }
 
-
 class NativeCodegenEnqueuer extends NativeEnqueuerBase {
-
   final CodeEmitterTask emitter;
 
   final Set<ClassElement> doneAddSubtypes = new Set<ClassElement>();
 
   NativeCodegenEnqueuer(Enqueuer world, Compiler compiler, this.emitter)
-    : super(world, compiler, compiler.enableNativeLiveTypeAnalysis);
+      : super(world, compiler, compiler.options.enableNativeLiveTypeAnalysis);
 
   void processNativeClasses(Iterable<LibraryElement> libraries) {
     super.processNativeClasses(libraries);
@@ -604,7 +678,7 @@ class NativeCodegenEnqueuer extends NativeEnqueuerBase {
   }
 
   void addSubtypes(ClassElement cls, NativeEmitter emitter) {
-    if (!cls.isNative) return;
+    if (!backend.isNative(cls)) return;
     if (doneAddSubtypes.contains(cls)) return;
     doneAddSubtypes.add(cls);
 
@@ -613,9 +687,8 @@ class NativeCodegenEnqueuer extends NativeEnqueuerBase {
     addSubtypes(cls.superclass, emitter);
 
     for (DartType type in cls.allSupertypes) {
-      List<Element> subtypes = emitter.subtypes.putIfAbsent(
-          type.element,
-          () => <ClassElement>[]);
+      List<Element> subtypes =
+          emitter.subtypes.putIfAbsent(type.element, () => <ClassElement>[]);
       subtypes.add(cls);
     }
 
@@ -624,13 +697,12 @@ class NativeCodegenEnqueuer extends NativeEnqueuerBase {
     // natives classes.
     ClassElement superclass = cls.superclass;
     while (superclass != null && superclass.isMixinApplication) {
-      assert(!superclass.isNative);
+      assert(!backend.isNative(superclass));
       superclass = superclass.superclass;
     }
 
-    List<Element> directSubtypes = emitter.directSubtypes.putIfAbsent(
-        superclass,
-        () => <ClassElement>[]);
+    List<Element> directSubtypes =
+        emitter.directSubtypes.putIfAbsent(superclass, () => <ClassElement>[]);
     directSubtypes.add(cls);
   }
 

@@ -2,7 +2,9 @@
 // for details. All rights reserved. Use of this source code is governed by a
 // BSD-style license that can be found in the LICENSE file.
 
-part of tree;
+import '../tokens/token.dart' show Token;
+import '../util/util.dart';
+import 'nodes.dart';
 
 /**
  * Pretty-prints Node tree in XML-like format.
@@ -10,100 +12,18 @@ part of tree;
  * TODO(smok): Add main() to run from command-line to print out tree for given
  * .dart file.
  */
-class PrettyPrinter extends Indentation implements Visitor {
-
-  StringBuffer sb;
-  Link<String> tagStack;
-
-  PrettyPrinter() :
-      sb = new StringBuffer(),
-      tagStack = const Link<String>();
-
-  void pushTag(String tag) {
-    tagStack = tagStack.prepend(tag);
-    indentMore();
-  }
-
-  String popTag() {
-    assert(!tagStack.isEmpty);
-    String tag = tagStack.head;
-    tagStack = tagStack.tail;
-    indentLess();
-    return tag;
-  }
-
-  /**
-   * Adds given string to result string.
-   */
-  void add(String string) {
-    sb.write(string);
-  }
-
-  void addBeginAndEndTokensToParams(Node node, Map params) {
+class PrettyPrinter extends Indentation with Tagging<Node> implements Visitor {
+  @override
+  void addDefaultParameters(Node node, Map params) {
     params['getBeginToken'] = tokenToStringOrNull(node.getBeginToken());
     params['getEndToken'] = tokenToStringOrNull(node.getEndToken());
   }
 
-  /**
-   * Adds given node type to result string.
-   * The method "opens" the node, meaning that all output after calling
-   * this method and before calling closeNode() will represent contents
-   * of given node.
-   */
-  void openNode(Node node, String type, [Map params]) {
-    if (params == null) params = new Map();
-    addCurrentIndent();
-    sb.write("<");
-    addBeginAndEndTokensToParams(node, params);
-    addTypeWithParams(type, params);
-    sb.write(">\n");
-    pushTag(type);
-  }
-
-  /**
-   * Adds given node to result string.
-   */
-  void openAndCloseNode(Node node, String type, [Map params]) {
-    if (params == null) params = new Map();
-    addCurrentIndent();
-    sb.write("<");
-    addBeginAndEndTokensToParams(node, params);
-    addTypeWithParams(type, params);
-    sb.write("/>\n");
-  }
-
-  /**
-   * Closes current node type.
-   */
-  void closeNode() {
-    String tag = popTag();
-    addCurrentIndent();
-    sb.write("</");
-    addTypeWithParams(tag);
-    sb.write(">\n");
-  }
-
-  void addTypeWithParams(String type, [Map params]) {
-    if (params == null) params = new Map();
-    sb.write("${type}");
-    params.forEach((k, v) {
-      String value;
-      if (v != null) {
-        var str = v;
-        if (v is Token) str = v.value;
-        value = str
-            .replaceAll("<", "&lt;")
-            .replaceAll(">", "&gt;")
-            .replaceAll('"', "'");
-      } else {
-        value = "[null]";
-      }
-      sb.write(' $k="$value"');
-    });
-  }
-
-  void addCurrentIndent() {
-    sb.write(indentation);
+  String valueToString(var value) {
+    if (value is Token) {
+      return value.value;
+    }
+    return value;
   }
 
   /**
@@ -121,10 +41,13 @@ class PrettyPrinter extends Indentation implements Visitor {
     closeNode();
   }
 
+  visitAssert(Assert node) {
+    visitNodeWithChildren(node, "Assert");
+  }
+
   visitAsyncModifier(AsyncModifier node) {
     openAndCloseNode(node, "AsyncModifier",
-        {'asyncToken': node.asyncToken,
-         'starToken': node.starToken});
+        {'asyncToken': node.asyncToken, 'starToken': node.starToken});
   }
 
   visitBlock(Block node) {
@@ -152,9 +75,8 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitClassNode(ClassNode node) {
-    openNode(node, "ClassNode", {
-      "extendsKeyword" : tokenToStringOrNull(node.extendsKeyword)
-    });
+    openNode(node, "ClassNode",
+        {"extendsKeyword": tokenToStringOrNull(node.extendsKeyword)});
     visitChildNode(node.name, "name");
     visitChildNode(node.superclass, "superclass");
     visitChildNode(node.interfaces, "interfaces");
@@ -166,8 +88,18 @@ class PrettyPrinter extends Indentation implements Visitor {
     visitNodeWithChildren(node, "Conditional");
   }
 
+  visitConditionalUri(ConditionalUri node) {
+    visitNodeWithChildren(node, "ConditionalUri");
+  }
+
   visitContinueStatement(ContinueStatement node) {
     visitNodeWithChildren(node, "ContinueStatement");
+  }
+
+  visitDottedName(DottedName node) {
+    openNode(node, "DottedName");
+    visitChildNode(node.identifiers, "identifiers");
+    closeNode();
   }
 
   visitDoWhile(DoWhile node) {
@@ -191,9 +123,18 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitForIn(ForIn node) {
-    openNode(node, "ForIn", {'await': node.awaitToken});
     node.visitChildren(this);
     closeNode();
+  }
+
+  visitAsyncForIn(AsyncForIn node) {
+    openNode(node, "AsyncForIn");
+    visitForIn(node);
+  }
+
+  visitSyncForIn(SyncForIn node) {
+    openNode(node, "SyncForIn");
+    visitForIn(node);
   }
 
   visitFunctionDeclaration(FunctionDeclaration node) {
@@ -201,9 +142,8 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitFunctionExpression(FunctionExpression node) {
-    openNode(node, "FunctionExpression", {
-      "getOrSet" : tokenToStringOrNull(node.getOrSet)
-    });
+    openNode(node, "FunctionExpression",
+        {"getOrSet": tokenToStringOrNull(node.getOrSet)});
     visitChildNode(node.modifiers, "modifiers");
     visitChildNode(node.returnType, "returnType");
     visitChildNode(node.name, "name");
@@ -214,7 +154,7 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitIdentifier(Identifier node) {
-    openAndCloseNode(node, "Identifier", {"token" : node.token});
+    openAndCloseNode(node, "Identifier", {"token": node.token});
   }
 
   visitIf(If node) {
@@ -231,7 +171,7 @@ class PrettyPrinter extends Indentation implements Visitor {
 
   // Custom.
   printLiteral(Literal node, String type) {
-    openAndCloseNode(node, type, {"value" : node.value.toString()});
+    openAndCloseNode(node, type, {"value": node.value.toString()});
   }
 
   visitLiteralBool(LiteralBool node) {
@@ -250,9 +190,8 @@ class PrettyPrinter extends Indentation implements Visitor {
   tokenToStringOrNull(Token token) => token == null ? null : token.stringValue;
 
   visitLiteralList(LiteralList node) {
-    openNode(node, "LiteralList", {
-      "constKeyword" : tokenToStringOrNull(node.constKeyword)
-    });
+    openNode(node, "LiteralList",
+        {"constKeyword": tokenToStringOrNull(node.constKeyword)});
     visitChildNode(node.typeArguments, "typeArguments");
     visitChildNode(node.elements, "elements");
     closeNode();
@@ -271,8 +210,7 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitLiteralString(LiteralString node) {
-    openAndCloseNode(node, "LiteralString",
-        {"value" : node.token});
+    openAndCloseNode(node, "LiteralString", {"value": node.token});
   }
 
   visitMixinApplication(MixinApplication node) {
@@ -296,7 +234,7 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitNodeList(NodeList node) {
-    var params = { "delimiter" : node.delimiter };
+    var params = {"delimiter": node.delimiter};
     if (node.isEmpty) {
       openAndCloseNode(node, "NodeList", params);
     } else {
@@ -307,7 +245,7 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitOperator(Operator node) {
-    openAndCloseNode(node, "Operator", {"value" : node.token});
+    openAndCloseNode(node, "Operator", {"value": node.token});
   }
 
   visitParenthesizedExpression(ParenthesizedExpression node) {
@@ -349,9 +287,9 @@ class PrettyPrinter extends Indentation implements Visitor {
 
   openSendNodeWithFields(Send node, String type) {
     openNode(node, type, {
-        "isPrefix" : "${node.isPrefix}",
-        "isPostfix" : "${node.isPostfix}",
-        "isIndex" : "${node.isIndex}"
+      "isPrefix": "${node.isPrefix}",
+      "isPostfix": "${node.isPostfix}",
+      "isIndex": "${node.isIndex}"
     });
     visitChildNode(node.receiver, "receiver");
     visitChildNode(node.selector, "selector");
@@ -438,30 +376,33 @@ class PrettyPrinter extends Indentation implements Visitor {
   }
 
   visitMetadata(Metadata node) {
-    openNode(node, "Metadata", {
-      "token": node.token
-    });
+    openNode(node, "Metadata", {"token": node.token});
     visitChildNode(node.expression, "expression");
     closeNode();
   }
 
   visitCombinator(Combinator node) {
-    openNode(node, "Combinator", {"isShow" : "${node.isShow}",
-                                  "isHide" : "${node.isHide}"});
+    openNode(node, "Combinator",
+        {"isShow": "${node.isShow}", "isHide": "${node.isHide}"});
     closeNode();
   }
 
   visitExport(Export node) {
     openNode(node, "Export");
     visitChildNode(node.uri, "uri");
+    if (node.conditionalUris != null) {
+      visitChildNode(node.conditionalUris, "conditionalUris");
+    }
     visitChildNode(node.combinators, "combinators");
     closeNode();
   }
 
   visitImport(Import node) {
-    openNode(node, "Import", {
-      "isDeferred" : "${node.isDeferred}"});
+    openNode(node, "Import", {"isDeferred": "${node.isDeferred}"});
     visitChildNode(node.uri, "uri");
+    if (node.conditionalUris != null) {
+      visitChildNode(node.conditionalUris, "conditionalUris");
+    }
     visitChildNode(node.combinators, "combinators");
     if (node.prefix != null) {
       visitChildNode(node.prefix, "prefix");

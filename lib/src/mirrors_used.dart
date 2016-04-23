@@ -4,45 +4,30 @@
 
 library dart2js.mirrors_used;
 
+import 'common/tasks.dart' show CompilerTask;
+import 'common.dart';
+import 'compile_time_constants.dart' show ConstantCompiler;
+import 'compiler.dart' show Compiler;
 import 'constants/expressions.dart';
-import 'constants/values.dart' show
-    ConstantValue,
-    ConstructedConstantValue,
-    ListConstantValue,
-    StringConstantValue,
-    TypeConstantValue;
-
-import 'dart_types.dart' show
-    DartType,
-    InterfaceType,
-    TypeKind;
-
-import 'dart2jslib.dart' show
-    Compiler,
-    CompilerTask,
-    ConstantCompiler,
-    MessageKind,
-    TreeElements,
-    invariant;
-
-import 'elements/elements.dart' show
-    ClassElement,
-    Element,
-    LibraryElement,
-    MetadataAnnotation,
-    ScopeContainerElement,
-    VariableElement;
-
-import 'tree/tree.dart' show
-    Import,
-    LibraryTag,
-    NamedArgument,
-    NewExpression,
-    Node;
-
-import 'util/util.dart' show
-    Link,
-    Spannable;
+import 'constants/values.dart'
+    show
+        ConstantValue,
+        ConstructedConstantValue,
+        ListConstantValue,
+        StringConstantValue,
+        TypeConstantValue;
+import 'dart_types.dart' show DartType, InterfaceType;
+import 'elements/elements.dart'
+    show
+        ClassElement,
+        Element,
+        ImportElement,
+        LibraryElement,
+        MetadataAnnotation,
+        ScopeContainerElement,
+        VariableElement;
+import 'resolution/tree_elements.dart' show TreeElements;
+import 'tree/tree.dart' show NamedArgument, NewExpression, Node;
 
 /**
  * Compiler task that analyzes MirrorsUsed annotations.
@@ -96,8 +81,7 @@ class MirrorUsageAnalyzerTask extends CompilerTask {
   Set<LibraryElement> librariesWithUsage;
   MirrorUsageAnalyzer analyzer;
 
-  MirrorUsageAnalyzerTask(Compiler compiler)
-      : super(compiler) {
+  MirrorUsageAnalyzerTask(Compiler compiler) : super(compiler) {
     analyzer = new MirrorUsageAnalyzer(compiler, this);
   }
 
@@ -122,9 +106,8 @@ class MirrorUsageAnalyzerTask extends CompilerTask {
   bool hasMirrorUsage(Element element) {
     LibraryElement library = element.library;
     // Internal libraries always have implicit mirror usage.
-    return library.isInternalLibrary
-        || (librariesWithUsage != null
-            && librariesWithUsage.contains(library));
+    return library.isInternalLibrary ||
+        (librariesWithUsage != null && librariesWithUsage.contains(library));
   }
 
   /// Call-back from the resolver to analyze MirorsUsed annotations. The result
@@ -135,13 +118,11 @@ class MirrorUsageAnalyzerTask extends CompilerTask {
       NamedArgument named = argument.asNamedArgument();
       if (named == null) continue;
       ConstantCompiler constantCompiler = compiler.resolver.constantCompiler;
-      ConstantValue value =
-          constantCompiler.compileNode(named.expression, mapping).value;
+      ConstantValue value = constantCompiler.getConstantValue(
+          constantCompiler.compileNode(named.expression, mapping));
 
-      MirrorUsageBuilder builder =
-          new MirrorUsageBuilder(
-              analyzer, mapping.analyzedElement.library, named.expression,
-              value, mapping);
+      MirrorUsageBuilder builder = new MirrorUsageBuilder(analyzer,
+          mapping.analyzedElement.library, named.expression, value, mapping);
 
       if (named.name.source == 'symbols') {
         analyzer.cachedStrings[value] =
@@ -175,6 +156,8 @@ class MirrorUsageAnalyzer {
         cachedStrings = new Map<ConstantValue, List<String>>(),
         cachedElements = new Map<ConstantValue, List<Element>>();
 
+  DiagnosticReporter get reporter => compiler.reporter;
+
   /// Collect and merge all @MirrorsUsed annotations. As a side-effect, also
   /// compute which libraries have the annotation (which is used by
   /// [MirrorUsageAnalyzerTask.hasMirrorUsage]).
@@ -201,12 +184,9 @@ class MirrorUsageAnalyzer {
         new Map<LibraryElement, List<MirrorUsage>>();
     for (LibraryElement library in compiler.libraryLoader.libraries) {
       if (library.isInternalLibrary) continue;
-      for (LibraryTag tag in library.tags) {
-        Import importTag = tag.asImport();
-        if (importTag == null) continue;
-        compiler.withCurrentElement(library, () {
-          List<MirrorUsage> usages =
-              mirrorsUsedOnLibraryTag(library, importTag);
+      for (ImportElement import in library.imports) {
+        reporter.withCurrentElement(library, () {
+          List<MirrorUsage> usages = mirrorsUsedOnLibraryTag(library, import);
           if (usages != null) {
             List<MirrorUsage> existing = result[library];
             if (existing != null) {
@@ -246,8 +226,8 @@ class MirrorUsageAnalyzer {
         }
       }
     });
-    propagatedOverrides.forEach((LibraryElement overridden,
-                                 List<MirrorUsage> overriddenUsages) {
+    propagatedOverrides.forEach(
+        (LibraryElement overridden, List<MirrorUsage> overriddenUsages) {
       List<MirrorUsage> usages =
           usageMap.putIfAbsent(overridden, () => <MirrorUsage>[]);
       usages.addAll(overriddenUsages);
@@ -256,19 +236,20 @@ class MirrorUsageAnalyzer {
 
   /// Find @MirrorsUsed annotations on the given import [tag] in [library]. The
   /// annotations are represented as [MirrorUsage].
-  List<MirrorUsage> mirrorsUsedOnLibraryTag(LibraryElement library,
-                                            Import tag) {
-    LibraryElement importedLibrary = library.getLibraryFromTag(tag);
+  List<MirrorUsage> mirrorsUsedOnLibraryTag(
+      LibraryElement library, ImportElement import) {
+    LibraryElement importedLibrary = import.importedLibrary;
     if (importedLibrary != compiler.mirrorsLibrary) {
       return null;
     }
     List<MirrorUsage> result = <MirrorUsage>[];
-    for (MetadataAnnotation metadata in tag.metadata) {
-      metadata.ensureResolved(compiler);
-      Element element =
-          metadata.constant.value.getType(compiler.coreTypes).element;
+    for (MetadataAnnotation metadata in import.metadata) {
+      metadata.ensureResolved(compiler.resolution);
+      ConstantValue value =
+          compiler.constants.getConstantValue(metadata.constant);
+      Element element = value.getType(compiler.coreTypes).element;
       if (element == compiler.mirrorsUsedClass) {
-        result.add(buildUsage(metadata.constant.value));
+        result.add(buildUsage(value));
       }
     }
     return result;
@@ -299,8 +280,9 @@ class MirrorUsageAnalyzer {
     // TOOO(ahe): Should be an instance method on MirrorUsage.
     if (a.symbols == null && a.targets == null && a.metaTargets == null) {
       return b;
-    } else if (
-        b.symbols == null && b.targets == null && b.metaTargets == null) {
+    } else if (b.symbols == null &&
+        b.targets == null &&
+        b.metaTargets == null) {
       return a;
     }
     // TODO(ahe): Test the following cases.
@@ -328,16 +310,15 @@ class MirrorUsageAnalyzer {
   /// Convert a [constant] to an instance of [MirrorUsage] using information
   /// that was resolved during [MirrorUsageAnalyzerTask.validate].
   MirrorUsage buildUsage(ConstructedConstantValue constant) {
-    Map<Element, ConstantValue> fields = constant.fieldElements;
-    VariableElement symbolsField = compiler.mirrorsUsedClass.lookupLocalMember(
-        'symbols');
-    VariableElement targetsField = compiler.mirrorsUsedClass.lookupLocalMember(
-        'targets');
+    Map<Element, ConstantValue> fields = constant.fields;
+    VariableElement symbolsField =
+        compiler.mirrorsUsedClass.lookupLocalMember('symbols');
+    VariableElement targetsField =
+        compiler.mirrorsUsedClass.lookupLocalMember('targets');
     VariableElement metaTargetsField =
-        compiler.mirrorsUsedClass.lookupLocalMember(
-            'metaTargets');
-    VariableElement overrideField = compiler.mirrorsUsedClass.lookupLocalMember(
-        'override');
+        compiler.mirrorsUsedClass.lookupLocalMember('metaTargets');
+    VariableElement overrideField =
+        compiler.mirrorsUsedClass.lookupLocalMember('override');
 
     return new MirrorUsage(
         cachedStrings[fields[symbolsField]],
@@ -357,14 +338,12 @@ class MirrorUsage {
   MirrorUsage(this.symbols, this.targets, this.metaTargets, this.override);
 
   String toString() {
-    return
-        'MirrorUsage('
+    return 'MirrorUsage('
         'symbols = $symbols, '
         'targets = $targets, '
         'metaTargets = $metaTargets, '
         'override = $override'
         ')';
-
   }
 }
 
@@ -375,14 +354,12 @@ class MirrorUsageBuilder {
   final ConstantValue constant;
   final TreeElements elements;
 
-  MirrorUsageBuilder(
-      this.analyzer,
-      this.enclosingLibrary,
-      this.spannable,
-      this.constant,
-      this.elements);
+  MirrorUsageBuilder(this.analyzer, this.enclosingLibrary, this.spannable,
+      this.constant, this.elements);
 
   Compiler get compiler => analyzer.compiler;
+
+  DiagnosticReporter get reporter => analyzer.reporter;
 
   /// Convert a constant to a list of [String] and [Type] values. If the
   /// constant is a single [String], it is assumed to be a comma-separated list
@@ -392,13 +369,13 @@ class MirrorUsageBuilder {
   /// [onlyStrings] is true, the returned list is a [:List<String>:] and any
   /// [Type] values are treated as an error (meaning that the value is ignored
   /// and a hint is emitted).
-  List convertConstantToUsageList(
-      ConstantValue constant, { bool onlyStrings: false }) {
+  List convertConstantToUsageList(ConstantValue constant,
+      {bool onlyStrings: false}) {
     if (constant.isNull) {
       return null;
     } else if (constant.isList) {
       ListConstantValue list = constant;
-      List result = onlyStrings ? <String> [] : [];
+      List result = onlyStrings ? <String>[] : [];
       for (ConstantValue entry in list.entries) {
         if (entry.isString) {
           StringConstantValue string = entry;
@@ -411,9 +388,8 @@ class MirrorUsageBuilder {
           MessageKind kind = onlyStrings
               ? MessageKind.MIRRORS_EXPECTED_STRING
               : MessageKind.MIRRORS_EXPECTED_STRING_OR_TYPE;
-          compiler.reportHint(
-              node,
-              kind, {'name': node, 'type': apiTypeOf(entry)});
+          reporter.reportHintMessage(
+              node, kind, {'name': node, 'type': apiTypeOf(entry)});
         }
       }
       return result;
@@ -430,9 +406,8 @@ class MirrorUsageBuilder {
       MessageKind kind = onlyStrings
           ? MessageKind.MIRRORS_EXPECTED_STRING_OR_LIST
           : MessageKind.MIRRORS_EXPECTED_STRING_TYPE_OR_LIST;
-      compiler.reportHint(
-          node,
-          kind, {'name': node, 'type': apiTypeOf(constant)});
+      reporter.reportHintMessage(
+          node, kind, {'name': node, 'type': apiTypeOf(constant)});
       return null;
     }
   }
@@ -444,10 +419,10 @@ class MirrorUsageBuilder {
     if (type.isInterfaceType && library.isInternalLibrary) {
       InterfaceType interface = type;
       ClassElement cls = type.element;
-      cls.ensureResolved(compiler);
+      cls.ensureResolved(compiler.resolution);
       for (DartType supertype in cls.allSupertypes) {
-        if (supertype.isInterfaceType
-            && !supertype.element.library.isInternalLibrary) {
+        if (supertype.isInterfaceType &&
+            !supertype.element.library.isInternalLibrary) {
           return interface.asInstanceOf(supertype.element);
         }
       }
@@ -477,16 +452,16 @@ class MirrorUsageBuilder {
         LibraryElement libraryCandiate;
         String libraryNameCandiate;
         for (LibraryElement l in compiler.libraryLoader.libraries) {
-          if (l.hasLibraryName()) {
-            String libraryName = l.getLibraryOrScriptName();
+          if (l.hasLibraryName) {
+            String libraryName = l.libraryOrScriptName;
             if (string == libraryName) {
               // Found an exact match.
               libraryCandiate = l;
               libraryNameCandiate = libraryName;
               break;
             } else if (string.startsWith('$libraryName.')) {
-              if (libraryNameCandiate == null
-                  || libraryNameCandiate.length < libraryName.length) {
+              if (libraryNameCandiate == null ||
+                  libraryNameCandiate.length < libraryName.length) {
                 // Found a better candiate
                 libraryCandiate = l;
                 libraryNameCandiate = libraryName;
@@ -498,8 +473,7 @@ class MirrorUsageBuilder {
         if (libraryNameCandiate == string) {
           e = libraryCandiate;
         } else if (libraryNameCandiate != null) {
-          e = resolveLocalExpression(
-              libraryCandiate,
+          e = resolveLocalExpression(libraryCandiate,
               string.substring(libraryNameCandiate.length + 1).split('.'));
         } else {
           e = resolveExpression(string);
@@ -515,8 +489,9 @@ class MirrorUsageBuilder {
     List<String> identifiers = expression.split('.');
     Element element = enclosingLibrary.find(identifiers[0]);
     if (element == null) {
-      compiler.reportHint(
-          spannable, MessageKind.MIRRORS_CANNOT_RESOLVE_IN_CURRENT_LIBRARY,
+      reporter.reportHintMessage(
+          spannable,
+          MessageKind.MIRRORS_CANNOT_RESOLVE_IN_CURRENT_LIBRARY,
           {'name': expression});
       return null;
     } else {
@@ -533,13 +508,14 @@ class MirrorUsageBuilder {
       if (e == null) {
         if (current.isLibrary) {
           LibraryElement library = current;
-          compiler.reportHint(
-              spannable, MessageKind.MIRRORS_CANNOT_RESOLVE_IN_LIBRARY,
-              {'name': identifiers[0],
-               'library': library.getLibraryOrScriptName()});
+          reporter.reportHintMessage(
+              spannable,
+              MessageKind.MIRRORS_CANNOT_RESOLVE_IN_LIBRARY,
+              {'name': identifiers[0], 'library': library.libraryOrScriptName});
         } else {
-          compiler.reportHint(
-              spannable, MessageKind.MIRRORS_CANNOT_FIND_IN_ELEMENT,
+          reporter.reportHintMessage(
+              spannable,
+              MessageKind.MIRRORS_CANNOT_FIND_IN_ELEMENT,
               {'name': identifier, 'element': current.name});
         }
         return current;
@@ -556,7 +532,7 @@ class MirrorUsageBuilder {
       ScopeContainerElement scope = element;
       if (element.isClass) {
         ClassElement cls = element;
-        cls.ensureResolved(compiler);
+        cls.ensureResolved(compiler.resolution);
       }
       return scope.localLookup(name);
     }
@@ -567,7 +543,7 @@ class MirrorUsageBuilder {
   Spannable positionOf(ConstantValue constant) {
     Node node;
     elements.forEachConstantNode((Node n, ConstantExpression c) {
-      if (node == null && c.value == constant) {
+      if (node == null && compiler.constants.getConstantValue(c) == constant) {
         node = n;
       }
     });

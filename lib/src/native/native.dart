@@ -4,61 +4,39 @@
 
 library native;
 
-import 'dart:collection' show Queue;
-
-import '../constants/values.dart';
-import '../dart2jslib.dart';
-import '../dart_types.dart';
+import '../compiler.dart' show Compiler;
 import '../elements/elements.dart';
-import '../elements/modelx.dart'
-    show ClassElementX, FunctionElementX, LibraryElementX;
-import '../js/js.dart' as js;
-import '../js_backend/js_backend.dart';
-import '../js_emitter/js_emitter.dart' show CodeEmitterTask, NativeEmitter;
-import '../resolution/resolution.dart' show ResolverVisitor;
-import '../scanner/scannerlib.dart';
-import '../ssa/ssa.dart';
-import '../tree/tree.dart';
-import '../universe/universe.dart' show SideEffects;
-import '../util/util.dart';
 
-part 'behavior.dart';
-part 'enqueue.dart';
-part 'js.dart';
-part 'scanner.dart';
-part 'ssa.dart';
+export 'behavior.dart';
+export 'enqueue.dart';
+export 'js.dart';
+export 'scanner.dart';
+export 'ssa.dart';
 
-void maybeEnableNative(Compiler compiler,
-                       LibraryElementX library) {
-  String libraryName = library.canonicalUri.toString();
-  if (library.entryCompilationUnit.script.name.contains(
-          'dart/tests/compiler/dart2js_native')
-      || libraryName == 'dart:async'
-      || libraryName == 'dart:html'
-      || libraryName == 'dart:html_common'
-      || libraryName == 'dart:indexed_db'
-      || libraryName == 'dart:js'
-      || libraryName == 'dart:svg'
-      || libraryName == 'dart:_native_typed_data'
-      || libraryName == 'dart:web_audio'
-      || libraryName == 'dart:web_gl'
-      || libraryName == 'dart:web_sql'
-      || compiler.allowNativeExtensions) {
-    library.canUseNative = true;
+const Iterable<String> _allowedDartSchemePaths = const <String>[
+  'async',
+  'html',
+  'html_common',
+  'indexed_db',
+  'js',
+  'svg',
+  '_native_typed_data',
+  'web_audio',
+  'web_gl',
+  'web_sql'
+];
+
+bool maybeEnableNative(Compiler compiler, LibraryElement library) {
+  bool allowedTestLibrary() {
+    String scriptName = library.entryCompilationUnit.script.name;
+    return scriptName.contains('sdk/tests/compiler/dart2js_native') ||
+        scriptName.contains('sdk/tests/compiler/dart2js_extra');
   }
-}
+  bool allowedDartLibary() {
+    Uri uri = library.canonicalUri;
+    if (uri.scheme != 'dart') return false;
+    return _allowedDartSchemePaths.contains(uri.path);
+  }
 
-// The tags string contains comma-separated 'words' which are either dispatch
-// tags (having JavaScript identifier syntax) and directives that begin with
-// `!`.
-List<String> nativeTagsOfClassRaw(ClassElement cls) {
-  String quotedName = cls.nativeTagInfo;
-  return quotedName.substring(1, quotedName.length - 1).split(',');
+  return allowedTestLibrary() || allowedDartLibary();
 }
-
-List<String> nativeTagsOfClass(ClassElement cls) {
-  return nativeTagsOfClassRaw(cls).where((s) => !s.startsWith('!')).toList();
-}
-
-bool nativeTagsForcedNonLeaf(ClassElement cls) =>
-    nativeTagsOfClassRaw(cls).contains('!nonleaf');

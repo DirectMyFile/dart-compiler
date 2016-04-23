@@ -9,13 +9,19 @@ class UnionTypeMask implements TypeMask {
 
   static const int MAX_UNION_LENGTH = 4;
 
+  // Set this flag to `true` to perform a set-membership based containment check
+  // instead of relying on normalized types. This is quite slow but can be
+  // helpful in debugging.
+  static const bool PERFORM_EXTRA_CONTAINS_CHECK = false;
+
   UnionTypeMask._internal(this.disjointMasks) {
     assert(disjointMasks.length > 1);
     assert(disjointMasks.every((TypeMask mask) => !mask.isUnion));
   }
 
   static TypeMask unionOf(Iterable<TypeMask> masks, ClassWorld classWorld) {
-    assert(masks.every((mask) => TypeMask.assertIsNormalized(mask, classWorld)));
+    assert(
+        masks.every((mask) => TypeMask.assertIsNormalized(mask, classWorld)));
     List<FlatTypeMask> disjoint = <FlatTypeMask>[];
     unionOfHelper(masks, disjoint, classWorld);
     if (disjoint.isEmpty) return new TypeMask.nonNullEmpty();
@@ -29,8 +35,7 @@ class UnionTypeMask implements TypeMask {
   }
 
   static void unionOfHelper(Iterable<TypeMask> masks,
-                            List<FlatTypeMask> disjoint,
-                            ClassWorld classWorld) {
+      List<FlatTypeMask> disjoint, ClassWorld classWorld) {
     // TODO(johnniwinther): Impose an order on the mask to ensure subclass masks
     // are preferred to subtype masks.
     for (TypeMask mask in masks) {
@@ -38,7 +43,7 @@ class UnionTypeMask implements TypeMask {
       if (mask.isUnion) {
         UnionTypeMask union = mask;
         unionOfHelper(union.disjointMasks, disjoint, classWorld);
-      } else if (mask.isEmpty && !mask.isNullable) {
+      } else if (mask.isEmpty) {
         continue;
       } else {
         FlatTypeMask flatMask = mask;
@@ -89,30 +94,36 @@ class UnionTypeMask implements TypeMask {
     bool useSubclass = masks.every((e) => !e.isSubtype);
     bool isNullable = masks.any((e) => e.isNullable);
 
+    List<ClassElement> masksBases = masks.map((mask) => mask.base).toList();
     Iterable<ClassElement> candidates =
-        classWorld.commonSupertypesOf(masks.map((mask) => mask.base));
+        classWorld.commonSupertypesOf(masksBases);
 
     // Compute the best candidate and its kind.
     ClassElement bestElement;
     int bestKind;
     int bestSize;
     for (ClassElement candidate in candidates) {
-      Iterable<ClassElement> subclasses = useSubclass
-          ? classWorld.subclassesOf(candidate)
-          : const <ClassElement>[];
+      bool isInstantiatedStrictSubclass(cls) =>
+          cls != candidate &&
+          classWorld.isDirectlyInstantiated(cls) &&
+          classWorld.isSubclassOf(cls, candidate);
+
       int size;
       int kind;
-      if (masks.every((t) => subclasses.contains(t.base))) {
+      if (useSubclass && masksBases.every(isInstantiatedStrictSubclass)) {
         // If both [this] and [other] are subclasses of the supertype,
         // then we prefer to construct a subclass type mask because it
         // will always be at least as small as the corresponding
         // subtype type mask.
         kind = FlatTypeMask.SUBCLASS;
-        size = subclasses.length;
-        assert(size <= classWorld.subtypesOf(candidate).length);
+        // TODO(sigmund, johnniwinther): computing length here (and below) is
+        // expensive. If we can't prevent `flatten` from being called a lot, it
+        // might be worth caching results.
+        size = classWorld.strictSubclassCount(candidate);
+        assert(size <= classWorld.strictSubtypeCount(candidate));
       } else {
         kind = FlatTypeMask.SUBTYPE;
-        size = classWorld.subtypesOf(candidate).length;
+        size = classWorld.strictSubtypeCount(candidate);
       }
       // Update the best candidate if the new one is better.
       if (bestElement == null || size < bestSize) {
@@ -128,8 +139,7 @@ class UnionTypeMask implements TypeMask {
     other = TypeMask.nonForwardingMask(other);
     if (!other.isUnion && disjointMasks.contains(other)) return this;
 
-    List<FlatTypeMask> newList =
-        new List<FlatTypeMask>.from(disjointMasks);
+    List<FlatTypeMask> newList = new List<FlatTypeMask>.from(disjointMasks);
     if (!other.isUnion) {
       newList.add(other);
     } else {
@@ -142,18 +152,30 @@ class UnionTypeMask implements TypeMask {
   TypeMask intersection(var other, ClassWorld classWorld) {
     other = TypeMask.nonForwardingMask(other);
     if (!other.isUnion && disjointMasks.contains(other)) return other;
+    if (other.isUnion && this == other) return this;
 
     List<TypeMask> intersections = <TypeMask>[];
     for (TypeMask current in disjointMasks) {
       if (other.isUnion) {
-        for (FlatTypeMask flatOther in other.disjointMasks) {
-          intersections.add(current.intersection(flatOther, classWorld));
+        if (other.disjointMasks.contains(current)) {
+          intersections.add(current);
+        } else {
+          for (FlatTypeMask flatOther in other.disjointMasks) {
+            intersections.add(current.intersection(flatOther, classWorld));
+          }
         }
       } else {
         intersections.add(current.intersection(other, classWorld));
       }
     }
     return new TypeMask.unionOf(intersections, classWorld);
+  }
+
+  bool isDisjoint(TypeMask other, ClassWorld classWorld) {
+    for (var current in disjointMasks) {
+      if (!current.isDisjoint(other, classWorld)) return false;
+    }
+    return true;
   }
 
   TypeMask nullable() {
@@ -170,7 +192,9 @@ class UnionTypeMask implements TypeMask {
     return new UnionTypeMask._internal(newIterable);
   }
 
+  bool get isEmptyOrNull => false;
   bool get isEmpty => false;
+  bool get isNull => false;
   bool get isNullable => disjointMasks.any((e) => e.isNullable);
   bool get isExact => false;
   bool get isUnion => true;
@@ -207,10 +231,10 @@ class UnionTypeMask implements TypeMask {
     // Check for other members.
     Iterable<ClassElement> members;
     if (flat.isSubclass) {
-      members = classWorld.subclassesOf(flat.base);
+      members = classWorld.strictSubclassesOf(flat.base);
     } else {
       assert(flat.isSubtype);
-      members = classWorld.subtypesOf(flat.base);
+      members = classWorld.strictSubtypesOf(flat.base);
     }
     return members.every((ClassElement cls) => this.contains(cls, classWorld));
   }
@@ -231,7 +255,11 @@ class UnionTypeMask implements TypeMask {
       }
       return disjointMasks.every((FlatTypeMask disjointMask) {
         bool contained = containedInAnyOf(disjointMask, union.disjointMasks);
-        assert(contained || !union.slowContainsCheck(disjointMask, classWorld));
+        if (PERFORM_EXTRA_CONTAINS_CHECK &&
+            !contained &&
+            union.slowContainsCheck(disjointMask, classWorld)) {
+          throw "TypeMask based containment check failed for $this and $other.";
+        }
         return contained;
       });
     }
@@ -245,7 +273,11 @@ class UnionTypeMask implements TypeMask {
     other = other.nonNullable(); // nullable is not canonicalized, so drop it.
     bool contained =
         disjointMasks.any((mask) => mask.containsMask(other, classWorld));
-    assert(contained || !slowContainsCheck(other, classWorld));
+    if (PERFORM_EXTRA_CONTAINS_CHECK &&
+        !contained &&
+        slowContainsCheck(other, classWorld)) {
+      throw "TypeMask based containment check failed for $this and $other.";
+    }
     return contained;
   }
 
@@ -290,18 +322,19 @@ class UnionTypeMask implements TypeMask {
   ClassElement singleClass(ClassWorld classWorld) => null;
 
   bool needsNoSuchMethodHandling(Selector selector, ClassWorld classWorld) {
-    return disjointMasks.any(
-        (e) => e.needsNoSuchMethodHandling(selector, classWorld));
+    return disjointMasks
+        .any((e) => e.needsNoSuchMethodHandling(selector, classWorld));
   }
 
   bool canHit(Element element, Selector selector, ClassWorld classWorld) {
     return disjointMasks.any((e) => e.canHit(element, selector, classWorld));
   }
 
-  Element locateSingleElement(Selector selector, Compiler compiler) {
+  Element locateSingleElement(
+      Selector selector, TypeMask mask, Compiler compiler) {
     Element candidate;
     for (FlatTypeMask mask in disjointMasks) {
-      Element current = mask.locateSingleElement(selector, compiler);
+      Element current = mask.locateSingleElement(selector, mask, compiler);
       if (current == null) {
         return null;
       } else if (candidate == null) {
@@ -314,12 +347,13 @@ class UnionTypeMask implements TypeMask {
   }
 
   String toString() {
-    String masksString = (disjointMasks.map((TypeMask mask) => mask.toString())
-        .toList()..sort()).join(", ");
+    String masksString =
+        (disjointMasks.map((TypeMask mask) => mask.toString()).toList()..sort())
+            .join(", ");
     return 'Union of [$masksString]';
   }
 
-  bool operator==(other) {
+  bool operator ==(other) {
     if (identical(this, other)) return true;
 
     bool containsAll() {
@@ -329,10 +363,10 @@ class UnionTypeMask implements TypeMask {
       });
     }
 
-    return other is UnionTypeMask
-        && other.isNullable == isNullable
-        && other.disjointMasks.length == disjointMasks.length
-        && containsAll();
+    return other is UnionTypeMask &&
+        other.isNullable == isNullable &&
+        other.disjointMasks.length == disjointMasks.length &&
+        containsAll();
   }
 
   int get hashCode {
