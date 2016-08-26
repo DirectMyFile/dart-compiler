@@ -33,6 +33,7 @@ import '../universe/use.dart' show DynamicUse, TypeUse, TypeUseKind;
 import '../universe/world_impact.dart' show WorldImpact, TransformedWorldImpact;
 import '../util/util.dart';
 import 'backend_ast_to_frontend_ast.dart' as backend2frontend;
+import '../js_backend/native_data.dart';
 
 part 'backend.dart';
 part 'renamer.dart';

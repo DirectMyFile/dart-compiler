@@ -18,6 +18,8 @@ class DartBackend extends Backend {
   final List<CompilerTask> tasks;
   final bool stripAsserts;
 
+  final NativeData nativeData = new NativeData();
+
   bool get supportsReflection => true;
 
   // TODO(zarah) Maybe change this to a command-line option.
